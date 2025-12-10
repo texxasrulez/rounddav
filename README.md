@@ -13,12 +13,17 @@
 
 A lightweight CalDAV, CardDAV, and WebDAV storage engine designed for self-hosters who want full control without dragging in a monster stack. RoundDAV powers calendars, contacts, and file storage behind Roundcube — cleanly and predictably.
 
+While this may work like any other sabre based server, this one is tailored for Roundcube specifically.
+
+There are two Roundcube plugins to use with this and extend the bridge between the two.
+
 ---
 
-While this may work like any other sabre based server, this one is tailored for Roundcube specifically.
-There are two Roundcube plugins to use with this and extend the bridge between the two.
-[RoundDAV Provision Roundcube Plugin](https://github.com/texxasrulez/rounddav_provision)
-[RoundDAV Files Roundcube Plugin](https://github.com/texxasrulez/rounddav_files)
+[RoundDAV Provision Roundcube Plugin](https://github.com/texxasrulez/rounddav_provision) - This plugin is the bridge between RoundDAV and Roundcube. It handles the logins/logouts. Creation of new users upon first Roundcube login.
+
+[RoundDAV Files Roundcube Plugin](https://github.com/texxasrulez/rounddav_files) - This plugin provides a Files tab in header to gain access to WebDAV easily. It also allows for attaching files from webdav.
+
+I have big plans for this RoundDAV Suite for Roundcube. This is what has been missing.
 
 ---
 
