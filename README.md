@@ -15,6 +15,13 @@ A lightweight CalDAV, CardDAV, and WebDAV storage engine designed for self-hoste
 
 ---
 
+While this may work like any other sabre based server, this one is tailored for Roundcube specifically.
+There are two Roundcube plugins to use with this and extend the bridge between the two.
+[RoundDAV Provision Roundcube Plugin](https://github.com/texxasrulez/rounddav_provision)
+[RoundDAV Files Roundcube Plugin](https://github.com/texxasrulez/rounddav_files)
+
+---
+
 ## Features
 
 - **CalDAV & CardDAV**: Standards-compliant calendars and addressbooks
