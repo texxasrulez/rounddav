@@ -1,0 +1,31 @@
+# rounddav/public/.htaccess
+
+# Make sure index.php is the front controller
+DirectoryIndex index.php
+
+# Basic hardening
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+
+    # IMPORTANT: this must match the actual URL path to this public dir
+    # Your DAV base is /rounddav/public/
+    RewriteBase /rounddav/public/
+
+    # If it's not an existing file or dir, send it to index.php
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# Explicitly allow DAV-ish verbs here (if mod_allowmethods is available)
+<IfModule mod_allowmethods.c>
+    AllowMethods GET POST OPTIONS PROPFIND REPORT PROPPATCH MKCOL DELETE PUT COPY MOVE LOCK UNLOCK
+</IfModule>
+
+# If your Apache uses the older authz/access model, make sure we don't
+# accidentally block by default.
+<IfModule mod_authz_core.c>
+    Require all granted
+</IfModule>

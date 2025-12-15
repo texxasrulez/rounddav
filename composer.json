@@ -1,0 +1,33 @@
+{
+  "name": "texxasrulez/rounddav",
+  "description": "RoundDAV - a SabreDAV-based CalDAV/CardDAV server tailored for Roundcube.",
+  "type": "project",
+    "homepage": "https://github.com/texxasrulez/rounddav",
+	"support": {
+		"issues": "https://github.com/texxasrulez/rounddav/issues",
+		"source": "https://github.com/texxasrulez/rounddav"
+  },
+  "license": "GPL-3.0",
+    "authors": [
+        {
+            "name": "Gene Hawkins",
+            "email": "texxasrulez@yahoo.com",
+            "role": "Lead"
+        }
+    ],
+  "require": {
+    "php": "^8.0",
+    "sabre/dav": "^4.7",
+    "ext-pdo": "*",
+    "ext-json": "*"
+  },
+  "suggest": {
+      "texxasrulez/rounddav_provision": "Required to use Roundcube for self Integration",
+      "texxasrulez/rounddav_files": "Required to have a Files page and attach RoundDAV Files from within Roundcube"
+  },
+  "autoload": {
+    "psr-4": {
+      "RoundDAV\\": "src/"
+    }
+  }
+}

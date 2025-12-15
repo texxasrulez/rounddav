@@ -1,22 +1,5 @@
 # RoundDAV Server
-
-[![Packagist Downloads](https://img.shields.io/packagist/dt/texxasrulez/rounddav?style=plastic&logo=packagist&logoColor=white&label=Downloads&labelColor=blue&color=gold)](https://packagist.org/packages/texxasrulez/rounddav)
-[![Packagist Version](https://img.shields.io/packagist/v/texxasrulez/rounddav?style=plastic&logo=packagist&logoColor=white&label=Version&labelColor=blue&color=limegreen)](https://packagist.org/packages/texxasrulez/rounddav)
-[![Github License](https://img.shields.io/github/license/texxasrulez/rounddav?style=plastic&logo=github&label=License&labelColor=blue&color=coral)](https://github.com/texxasrulez/rounddav/LICENSE)
-[![GitHub Stars](https://img.shields.io/github/stars/texxasrulez/rounddav?style=plastic&logo=github&label=Stars&labelColor=blue&color=deepskyblue)](https://github.com/texxasrulez/rounddav/stargazers)
-[![GitHub Issues](https://img.shields.io/github/issues/texxasrulez/rounddav?style=plastic&logo=github&label=Issues&labelColor=blue&color=aqua)](https://github.com/texxasrulez/rounddav/issues)
-[![GitHub Contributors](https://img.shields.io/github/contributors/texxasrulez/rounddav?style=plastic&logo=github&logoColor=white&label=Contributors&labelColor=blue&color=orchid)](https://github.com/texxasrulez/rounddav/graphs/contributors)
-[![GitHub Forks](https://img.shields.io/github/forks/texxasrulez/rounddav?style=plastic&logo=github&logoColor=white&label=Forks&labelColor=blue&color=darkorange)](https://github.com/texxasrulez/rounddav/forks)
-[![Donate Paypal](https://img.shields.io/badge/Paypal-Money_Please!-blue.svg?style=plastic&labelColor=blue&color=forestgreen&logo=paypal)](https://www.paypal.me/texxasrulez)
-
 A lightweight CalDAV, CardDAV, and WebDAV storage engine designed for self-hosters who want full control without dragging in a monster stack. RoundDAV powers calendars, contacts, and file storage behind Roundcube — cleanly and predictably.
-
----
-
-While this may work like any other sabre based server, this one is tailored for Roundcube specifically.
-There are two Roundcube plugins to use with this and extend the bridge between the two.
-[RoundDAV Provision Roundcube Plugin](https://github.com/texxasrulez/rounddav_provision)
-[RoundDAV Files Roundcube Plugin](https://github.com/texxasrulez/rounddav_files)
 
 ---
 
@@ -28,6 +11,7 @@ There are two Roundcube plugins to use with this and extend the bridge between t
 - **SSO-Ready**: Includes `/public/sso_login.php` and `/public/sso_logout.php`
 - **Admin UI**: Simple administration panel for principals, calendars, addressbooks
 - **Per-User Extras**: Extra calendars and addressbooks can be created on first login
+- **Bookmarks Engine**: Private + domain-shared bookmark storage with a JSON API
 - **Clean PHP**: No frameworks, minimal dependencies, easy to debug
 
 ---
@@ -87,8 +71,6 @@ https://your.server/rounddav/public/install.php
    - Admin username + password
 
 5. Submit. The installer writes `config/config.php` and initializes the database.
-
-6. Run composer update in root to install dependencies.
 
 ---
 
@@ -191,6 +173,59 @@ The endpoint replies with JSON, e.g.:
 
 ---
 
+## Bookmarks API
+
+RoundDAV ships with an opinionated bookmark store that Roundcube (and other clients) can use for private or domain-wide collections. It piggybacks on the existing `public/api.php` entry point:
+
+```
+POST /rounddav/public/api.php?r=bookmarks/list
+X-RoundDAV-Token: <shared-secret>   # trusted mode
+Content-Type: application/json
+```
+
+Available routes:
+
+| Route | Description |
+|-------|-------------|
+| `bookmarks/list` | Returns folders + bookmarks for the user (`include_shared` optional) |
+| `bookmarks/create` | Create a bookmark (`title`, `url`, `visibility`, optional folder / tags / notes) |
+| `bookmarks/update` | Update an existing bookmark (`id`, plus fields to change) |
+| `bookmarks/delete` | Remove a bookmark (`id`) |
+| `bookmarks/folder/create` | Create a folder (supports private or shared scopes) |
+| `bookmarks/folder/update` | Rename / reparent a folder |
+| `bookmarks/folder/delete` | Delete a folder (bookmarks move to root) |
+
+Authentication options:
+
+1. **Trusted** (`X-RoundDAV-Token`) – for Roundcube plugins on the same server. The token reuses `provision.shared_secret` unless you set `bookmarks.shared_secret`.
+2. **HTTP Basic** – for standalone clients (e.g. browser extensions) using the RoundDAV username/password. Permissions are enforced per user/domain.
+
+Config block (`config/config.php`):
+
+```php
+'bookmarks' => [
+    'enabled'                => true,
+    'max_private_per_user'   => 1000,
+    'max_shared_per_domain'  => 4000,
+    'shared_default_enabled' => true,
+    'shared_default_label'   => 'Shared Bookmarks',
+    'max_favicon_bytes'      => 24576,
+    'max_inline_icon_bytes'  => 8192,
+    'favicon_timeout'        => 4,
+    'shared_secret'          => '', // optional override
+],
+```
+
+Database tables are added via `config/rounddav.mysql.sql`:
+
+- `rounddav_bookmark_domains` – per-domain overrides (limits, labels, shared toggle)
+- `rounddav_bookmark_folders` – hierarchical folder tree (private or shared scope)
+- `rounddav_bookmarks` – bookmark records + favicon cache
+
+All shared bookmarks are automatically scoped to the user’s email domain (e.g. `example.com`). Users without an `@domain` fall into the special `Local users` bucket (`BookmarkService::LOCAL_DOMAIN`).
+
+---
+
 ## SSO Endpoints
 
 These are used by Roundcube (`rounddav_provision` + `rounddav_files`) to log users into the web UI without a second login.
@@ -240,11 +275,10 @@ You can:
 - View and manage principals
 - Create/delete calendars and addressbooks for each principal
 - Edit calendar/addressbook properties (URI, displayname, flags)
+- Configure domain-level bookmark sharing rules/limits
 - Toggle options like “tasks only” vs “events only” vs both
 
 The Admin UI is intentionally minimal, built for admins who already know what DAV is.
-
-[Admin README.md](README_rounddav_admin.md)
 
 ---
 
@@ -273,13 +307,3 @@ RoundDAV is meant to be:
 - Quiet enough to disappear behind Roundcube
 
 If you know Roundcube and a bit of PHP, you should be able to debug or extend this without fighting it.
-
-Enjoy!
-
-:moneybag: **Donations** :moneybag:
-
-If you use this plugin and would like to show your appreciation by buying me a cup of coffee, I surely would appreciate it. A regular cup of Joe is sufficient, but a Starbucks Coffee would be better ... \
-Zelle (Zelle is integrated within many major banks Mobile Apps by default) - Just send to texxasrulez at yahoo dot com \
-No Zelle in your banks mobile app, no problem, just click [Paypal](https://paypal.me/texxasrulez?locale.x=en_US) and I can make a Starbucks run ...
-
-I appreciate the interest in this plugin and hope all the best ...
