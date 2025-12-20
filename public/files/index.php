@@ -730,6 +730,7 @@ $viewableExtensions = [
             border: 1px solid var(--files-thborder);
             color: var(--files-thtext);
             padding: 6px 8px;
+            height: 25px;
         }
         th {
             background: var(--files-thbg);
@@ -834,7 +835,6 @@ $viewableExtensions = [
         .folder-row.folder-nonempty .folder-label::after {
             content: '🗐';
             display: inline-block;
-            margin-top: -15px;
             margin-left: 4px;
             font-size: 15px;
             font-style: normal;

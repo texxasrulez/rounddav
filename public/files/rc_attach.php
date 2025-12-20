@@ -730,6 +730,7 @@ $viewableExtensions = [
             border: 1px solid var(--files-thborder);
             color: var(--files-thtext);
             padding: 6px 8px;
+            height: 25px;
         }
         th {
             background: var(--files-thbg);

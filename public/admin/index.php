@@ -795,7 +795,14 @@ if (in_array($action, ['create_calendar', 'delete_calendar', 'update_calendar', 
         $error  = $e->getMessage();
         $action = 'dashboard';
     }
-} elseif (in_array($action, ['create_global_collection', 'delete_global_collection', 'add_global_permission', 'delete_global_permission'], true)) {
+} elseif (in_array($action, [
+    'create_global_collection',
+    'delete_global_collection',
+    'add_global_permission',
+    'delete_global_permission',
+    'update_calendar_share',
+    'update_addressbook_share',
+], true)) {
     rdv_require_admin();
 
     try {
