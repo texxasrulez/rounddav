@@ -936,7 +936,7 @@ $viewableExtensions = [
             font-size: 20px;
         }
         .rdv-preview-nav:hover {
-            background: rgba(59,130,246,0.7);
+            background: rgba(110, 110, 110, 0.7);
         }
         .rdv-preview-nav.prev {
             left: 16px;
