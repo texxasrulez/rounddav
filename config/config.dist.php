@@ -36,6 +36,29 @@ return [
 
     // Security / rate limiting knobs (wired for future RateLimiter logic).
     'security' => [
+        // If true, admin/files CSRF origin checks also trust X-Forwarded-Host.
+        // Enable this only when requests are coming through a trusted reverse proxy.
+        'trust_proxy_headers' => false,
+        // Optional response hardening headers for UI endpoints.
+        // Defaults are chosen to be iframe-friendly for Roundcube integration.
+        'headers' => [
+            'enabled' => true,
+            'x_content_type_options' => true, // sends X-Content-Type-Options: nosniff
+            'referrer_policy' => 'strict-origin-when-cross-origin',
+            // Keep empty by default so cross-origin Roundcube iframe embeds are not blocked.
+            // Set to SAMEORIGIN or DENY only when Roundcube and RoundDAV share the same origin.
+            'x_frame_options' => '',
+            // Optional CSP: disabled by default to avoid breaking embedded/inlined UI assets.
+            'csp' => [
+                'enabled' => false,
+                // If empty and enabled=true, a default policy is generated.
+                'policy' => '',
+                // Used only when policy is empty. Example: ["'self'", "https://mail.example.com"]
+                'frame_ancestors' => ["'self'"],
+            ],
+            // Optional Permissions-Policy value. Set empty string to disable this header.
+            'permissions_policy' => 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+        ],
         'rate_limit' => [
             // Toggle rate limiting for API-style endpoints once implemented.
             'enabled'       => true,
@@ -45,6 +68,55 @@ return [
             'window_sec'    => 300,
             // How long (in minutes) a client should be blocked after exceeding the limit.
             'block_minutes' => 30,
+            // One IP/CIDR per entry that should bypass rate limiting completely.
+            // Example: ['127.0.0.1', '192.168.1.0/24']
+            'ip_allowlist'  => [],
+            // Per-scope overrides. Scopes currently used: dav, api, admin, files, files_attach.
+            // Any omitted value falls back to global defaults above.
+            'scope_overrides' => [
+                'dav' => [
+                    'enabled'       => true,
+                    'max_requests'  => 100,
+                    'window_sec'    => 300,
+                    'block_minutes' => 30,
+                ],
+                'api' => [
+                    'enabled'       => true,
+                    'max_requests'  => 100,
+                    'window_sec'    => 300,
+                    'block_minutes' => 30,
+                ],
+                'admin' => [
+                    'enabled'       => true,
+                    'max_requests'  => 100,
+                    'window_sec'    => 300,
+                    'block_minutes' => 30,
+                ],
+                'files' => [
+                    'enabled'       => true,
+                    'max_requests'  => 100,
+                    'window_sec'    => 300,
+                    'block_minutes' => 30,
+                ],
+                'files_attach' => [
+                    'enabled'       => true,
+                    'max_requests'  => 100,
+                    'window_sec'    => 300,
+                    'block_minutes' => 30,
+                ],
+            ],
+        ],
+    ],
+
+    // Admin config.php backup retention policy.
+    'backups' => [
+        'config' => [
+            // Keep at least this many newest backups.
+            'keep_last' => 30,
+            // Delete backups older than this many days (0 disables age-based pruning).
+            'max_age_days' => 0,
+            // Auto-prune after config writes, restore actions, and manual backup creation.
+            'auto_prune' => true,
         ],
     ],
 
@@ -54,7 +126,7 @@ return [
     'admin' => [
         'username'      => 'admin',
         'email'         => '',
-        'password'		=> '', // legacy plain-text identifier (mirrors email for compatibility)
+        'password'		=> '', // legacy compatibility field (do not use for identity checks)
         'password_hash' => '',
     ],
 
@@ -86,6 +158,8 @@ return [
         'enabled' => false,
         // Adjust to a directory outside your web root, writable by the web server user.
         'root'    => '/srv/rounddav-files',
+        // Who can write to shared files area: "admins_only" or "authenticated_users".
+        'shared_write_policy' => 'admins_only',
     ],
 
     // Bookmarks engine (Roundcube integration + optional API access)
@@ -109,6 +183,12 @@ return [
     'globals' => [
         'addressbooks' => [],
         'calendars'    => [],
+    ],
+
+    // Optional endpoint exposure toggles.
+    'endpoints' => [
+        // Diagnostic request echo endpoint under /public/testdav.php.
+        'enable_testdav' => false,
     ],
 
     // Localization

@@ -24,12 +24,12 @@ The Admin UI uses the admin credentials configured in `config/config.php`:
 ```php
 'admin' => [
     'username'      => 'admin',
-    'password'      => 'admin@example.com',  // also used in templates for links
+    'email'         => 'admin@example.com',
     'password_hash' => '$2y$10$...',
 ],
 ```
 
-The `password_hash` is a standard `password_hash()` result. The `password` value is available for templates that want to show an Admin link only for the admin user.
+The `password_hash` is a standard `password_hash()` result. Use `admin.email` (or `admin.username`) when templates need to decide whether to show admin-only links.
 
 ---
 
@@ -124,3 +124,52 @@ The Admin UI is intentionally small, but can be extended with:
 - Logs and diagnostics panel
 
 Because the UI is just PHP + HTML, it’s straightforward to adjust it to your exact hosting environment.
+
+---
+
+## Config Backup, Restore, and Retention
+
+In **Server configuration** (`/public/admin/?action=config`), the **Config Snapshot** area includes operational controls for `config/config.php`.
+
+### Backup and restore actions
+
+- **Create backup now** creates a timestamped backup in `var/config_backups/`
+- **Download** exports one selected backup
+- **Restore** replaces the live `config.php` with a selected backup
+- **Download all as ZIP** exports all backups in one archive for off-host storage
+
+RoundDAV also creates a backup automatically before config writes/imports/restores.
+
+### Retention policy
+
+Retention can be configured in the same card:
+
+- `backups.config.keep_last` (minimum count to keep)
+- `backups.config.max_age_days` (age cutoff in days, `0` disables age pruning)
+- `backups.config.auto_prune` (prune automatically after config writes/restores/backups)
+
+Default template values:
+
+```php
+'backups' => [
+    'config' => [
+        'keep_last' => 30,
+        'max_age_days' => 0,
+        'auto_prune' => true,
+    ],
+],
+```
+
+Use **Prune now** to run retention cleanup immediately.
+
+### Roundcube embed-safe security header guidance
+
+If the Files UI is embedded in Roundcube via iframe (especially cross-origin):
+
+- Keep `security.headers.enabled = true`
+- Keep `security.headers.x_content_type_options = true`
+- Keep `security.headers.referrer_policy = strict-origin-when-cross-origin`
+- Keep `security.headers.x_frame_options = ''` for cross-origin embeds
+- If CSP is enabled, ensure `frame-ancestors` includes your Roundcube origin (for example `https://mail.example.com`)
+
+Use **Verify Current Headers** in Security diagnostics to compare expected vs live headers on Admin and Files endpoints.

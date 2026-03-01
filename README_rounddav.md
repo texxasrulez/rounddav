@@ -94,7 +94,7 @@ return [
 
     'admin' => [
         'username'      => 'admin',
-        'password'      => 'admin@example.com',  // used to match admin principal
+        'email'         => 'admin@example.com',
         'password_hash' => '$2y$10$...',
     ],
 
@@ -115,9 +115,10 @@ Key points:
 
 - `files.root` – base directory for per-user WebDAV storage.
 - `files.public_url` – where the browser reaches the Files UI.
-- `admin.password` – used in your templates to identify the admin user.
+- `admin.email` (or `admin.username`) – use this to identify the admin user in templates.
 - `provision.shared_secret` – for API calls if you ever protect them further.
 - `sso.secret` – must match `rounddav_sso_secret` in the Roundcube `rounddav_provision` plugin.
+- `security.headers` – optional response headers. Leave `x_frame_options` empty (default) if Files UI must be embedded by Roundcube on a different origin.
 
 ---
 

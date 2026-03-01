@@ -30,14 +30,16 @@ $ts   = $_GET['ts']   ?? '';
 $sig  = $_GET['sig']  ?? '';
 
 if ($user === '' || $ts === '' || $sig === '') {
-    error_log('[rounddav sso_login] Missing parameters: user=' . var_export($user, true) . ', ts=' . var_export($ts, true) . ', sig=' . var_export($sig, true));
+    error_log('[rounddav sso_login] Missing required parameters');
     http_response_code(400);
     echo 'Missing SSO parameters';
     exit;
 }
 
-if (!ctype_digit((string)$ts) || (time() - (int)$ts) > $ttl) {
-    error_log('[rounddav sso_login] Token expired or invalid ts=' . var_export($ts, true) . ', ttl=' . $ttl);
+$tsInt = (int) $ts;
+$now   = time();
+if (!ctype_digit((string)$ts) || ($now - $tsInt) > $ttl || $tsInt > ($now + 300)) {
+    error_log('[rounddav sso_login] Token expired or invalid timestamp');
     http_response_code(403);
     echo 'SSO token expired';
     exit;
@@ -47,7 +49,7 @@ $data     = $user . '|' . $ts;
 $expected = hash_hmac('sha256', $data, $secret);
 
 if (!hash_equals($expected, (string)$sig)) {
-    error_log('[rounddav sso_login] Invalid signature for user=' . var_export($user, true));
+    error_log('[rounddav sso_login] Invalid signature');
     http_response_code(403);
     echo 'Invalid SSO signature';
     exit;
@@ -55,7 +57,8 @@ if (!hash_equals($expected, (string)$sig)) {
 
 // Mark this RoundDAV session as authenticated for the given user.
 // This must match what the rest of RoundDAV / Files UI expects.
-error_log('[rounddav sso_login] Successful SSO for user=' . var_export($user, true));
+error_log('[rounddav sso_login] Successful SSO login');
+session_regenerate_id(true);
 $_SESSION['rounddav_files_user'] = $user;
 
 // Determine where to send the user after SSO login.
@@ -66,6 +69,6 @@ if (!$filesUrl) {
     $filesUrl = './files/';
 }
 
-error_log('[rounddav sso_login] Redirecting to files URL=' . var_export($filesUrl, true));
+error_log('[rounddav sso_login] Redirecting to files UI');
 header('Location: ' . $filesUrl);
 exit;

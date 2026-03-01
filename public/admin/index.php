@@ -10,10 +10,9 @@ declare(strict_types=1);
 // - Create / delete / EDIT addressbooks
 // - Config overview
 
-use PDO;
-use PDOException;
 use RoundDAV\Bookmarks\BookmarkRepository;
 use RoundDAV\Bookmarks\BookmarkService;
+use RoundDAV\Security\RateLimitGuard;
 
 session_start();
 
@@ -37,6 +36,87 @@ if (!defined('RDV_SHARING_CONFIG_FILE')) {
     define('RDV_SHARING_CONFIG_FILE', $baseDir . '/var/admin_sharing_config.json');
 }
 $rdvSharingConfigCache = null;
+
+function rdv_send_security_headers(array $config): void
+{
+    $headersCfg = (array) ($config['security']['headers'] ?? []);
+    if (array_key_exists('enabled', $headersCfg) && empty($headersCfg['enabled'])) {
+        return;
+    }
+
+    $sendNosniff = !array_key_exists('x_content_type_options', $headersCfg)
+        || !empty($headersCfg['x_content_type_options']);
+    if ($sendNosniff) {
+        header('X-Content-Type-Options: nosniff');
+    }
+
+    $referrerPolicy = trim((string) ($headersCfg['referrer_policy'] ?? 'strict-origin-when-cross-origin'));
+    if ($referrerPolicy !== '') {
+        header('Referrer-Policy: ' . $referrerPolicy);
+    }
+
+    $permissionsPolicy = trim((string) ($headersCfg['permissions_policy'] ?? 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'));
+    if ($permissionsPolicy !== '') {
+        header('Permissions-Policy: ' . $permissionsPolicy);
+    }
+
+    $xfo = trim((string) ($headersCfg['x_frame_options'] ?? ''));
+    if ($xfo !== '') {
+        header('X-Frame-Options: ' . $xfo);
+    }
+
+    $cspCfg = (array) ($headersCfg['csp'] ?? []);
+    if (empty($cspCfg['enabled'])) {
+        return;
+    }
+
+    $policy = trim((string) ($cspCfg['policy'] ?? ''));
+    if ($policy === '') {
+        $ancestors = $cspCfg['frame_ancestors'] ?? ["'self'"];
+        if (is_string($ancestors)) {
+            $ancestors = preg_split('/[\s,;]+/', $ancestors) ?: [];
+        }
+        if (!is_array($ancestors) || !$ancestors) {
+            $ancestors = ["'self'"];
+        }
+
+        $tokens = [];
+        foreach ($ancestors as $item) {
+            $token = trim((string) $item);
+            if ($token === '') {
+                continue;
+            }
+            if (strtolower($token) === 'self') {
+                $token = "'self'";
+            }
+            $tokens[] = $token;
+        }
+        if (!$tokens) {
+            $tokens = ["'self'"];
+        }
+
+        $policy = "default-src 'self'; "
+            . "img-src 'self' data: blob:; "
+            . "style-src 'self' 'unsafe-inline'; "
+            . "script-src 'self' 'unsafe-inline'; "
+            . "frame-ancestors " . implode(' ', $tokens);
+    }
+
+    header('Content-Security-Policy: ' . $policy);
+}
+
+rdv_send_security_headers($config);
+
+$rate = RateLimitGuard::checkAndConsume($config, 'admin');
+foreach (RateLimitGuard::headerMap($rate) as $name => $value) {
+    header($name . ': ' . $value);
+}
+if (empty($rate['allowed'])) {
+    http_response_code(429);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Too Many Requests\n";
+    exit;
+}
 
 // Database connection
 $db = $config['database'] ?? [];
@@ -87,6 +167,138 @@ function rdv_require_admin(): void
 function rdv_html(string $s): string
 {
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+}
+
+function rdv_normalize_host(string $host): string
+{
+    $host = trim($host);
+    if ($host === '') {
+        return '';
+    }
+
+    if ($host[0] === '[') {
+        $end = strpos($host, ']');
+        if ($end !== false) {
+            return strtolower(substr($host, 1, $end - 1));
+        }
+    }
+
+    return strtolower(trim(explode(':', $host)[0]));
+}
+
+function rdv_proxy_headers_trusted(): bool
+{
+    $security = $GLOBALS['config']['security'] ?? [];
+    return !empty($security['trust_proxy_headers']);
+}
+
+function rdv_request_hosts(): array
+{
+    $hosts = [];
+
+    $host = rdv_normalize_host((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    if ($host !== '') {
+        $hosts[] = $host;
+    }
+
+    if (rdv_proxy_headers_trusted()) {
+        $xfHost = trim((string) ($_SERVER['HTTP_X_FORWARDED_HOST'] ?? ''));
+        if ($xfHost !== '') {
+            foreach (explode(',', $xfHost) as $item) {
+                $candidate = rdv_normalize_host($item);
+                if ($candidate !== '') {
+                    $hosts[] = $candidate;
+                }
+            }
+        }
+    }
+
+    return array_values(array_unique($hosts));
+}
+
+function rdv_host_matches_url(string $url, array $hosts): bool
+{
+    $parts = @parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) {
+        return false;
+    }
+
+    $urlHost = strtolower((string) $parts['host']);
+    if ($urlHost === '' || !$hosts) {
+        return false;
+    }
+
+    return in_array($urlHost, $hosts, true);
+}
+
+function rdv_request_is_same_origin(): bool
+{
+    $hosts = rdv_request_hosts();
+    if (!$hosts) {
+        return true;
+    }
+
+    $origin = trim((string) ($_SERVER['HTTP_ORIGIN'] ?? ''));
+    if ($origin !== '') {
+        return rdv_host_matches_url($origin, $hosts);
+    }
+
+    $referer = trim((string) ($_SERVER['HTTP_REFERER'] ?? ''));
+    if ($referer !== '') {
+        return rdv_host_matches_url($referer, $hosts);
+    }
+
+    $secFetchSite = strtolower(trim((string) ($_SERVER['HTTP_SEC_FETCH_SITE'] ?? '')));
+    if ($secFetchSite === 'cross-site') {
+        return false;
+    }
+
+    return true;
+}
+
+function rdv_require_safe_post_request(): void
+{
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        return;
+    }
+
+    if (!rdv_request_is_same_origin()) {
+        http_response_code(403);
+        echo 'Cross-site POST denied';
+        exit;
+    }
+
+    $token = (string) ($_POST['_rdv_csrf'] ?? '');
+    if (!rdv_csrf_token_is_valid($token)) {
+        http_response_code(403);
+        echo 'Invalid CSRF token';
+        exit;
+    }
+}
+
+function rdv_csrf_token(): string
+{
+    $token = $_SESSION['rounddav_admin_csrf'] ?? '';
+    if (!is_string($token) || $token === '') {
+        try {
+            $token = bin2hex(random_bytes(32));
+        } catch (Throwable $e) {
+            $token = hash('sha256', uniqid('rdv_admin_csrf', true) . microtime(true));
+        }
+        $_SESSION['rounddav_admin_csrf'] = $token;
+    }
+
+    return $token;
+}
+
+function rdv_csrf_token_is_valid(string $token): bool
+{
+    if ($token === '') {
+        return false;
+    }
+
+    $expected = $_SESSION['rounddav_admin_csrf'] ?? '';
+    return is_string($expected) && $expected !== '' && hash_equals($expected, $token);
 }
 
 // Fetch principals
@@ -619,20 +831,385 @@ function rdv_write_config_file(array $config, string $configFile): void
     if (!is_dir($dir)) {
         @mkdir($dir, 0770, true);
     }
+    rdv_backup_config_file($configFile);
     if (@file_put_contents($configFile, $data, LOCK_EX) === false) {
         throw new RuntimeException('Unable to write config.php');
+    }
+    $settings = rdv_backup_retention_settings($config);
+    if (!empty($settings['auto_prune'])) {
+        rdv_prune_config_backups($configFile, $settings);
+    }
+}
+
+function rdv_backup_config_file(string $configFile): ?string
+{
+    if (!is_file($configFile)) {
+        return null;
+    }
+
+    $backupDir = rdv_config_backup_dir($configFile);
+    if (!is_dir($backupDir) && !@mkdir($backupDir, 0770, true) && !is_dir($backupDir)) {
+        throw new RuntimeException('Unable to create config backup directory.');
+    }
+
+    try {
+        $suffix = bin2hex(random_bytes(4));
+    } catch (\Throwable $e) {
+        $suffix = substr(sha1(uniqid('cfg', true)), 0, 8);
+    }
+
+    $backupFile = rtrim($backupDir, '/')
+        . '/config-'
+        . date('Ymd-His')
+        . '-'
+        . $suffix
+        . '.php';
+
+    if (!@copy($configFile, $backupFile)) {
+        throw new RuntimeException('Unable to create config backup file.');
+    }
+
+    return $backupFile;
+}
+
+function rdv_config_backup_dir(?string $configFile = null): string
+{
+    if ($configFile === null || $configFile === '') {
+        $configFile = RDV_CONFIG_FILE;
+    }
+
+    return dirname($configFile) . '/../var/config_backups';
+}
+
+function rdv_list_config_backups(?string $configFile = null, int $limit = 25): array
+{
+    $backupDir = rdv_config_backup_dir($configFile);
+    if (!is_dir($backupDir)) {
+        return [];
+    }
+
+    $files = glob(rtrim($backupDir, '/') . '/config-*.php') ?: [];
+    $items = [];
+    foreach ($files as $file) {
+        if (!is_file($file)) {
+            continue;
+        }
+        $items[] = [
+            'name' => basename($file),
+            'path' => $file,
+            'mtime' => @filemtime($file) ?: 0,
+            'size' => @filesize($file) ?: 0,
+        ];
+    }
+
+    usort($items, static function (array $a, array $b): int {
+        return $b['mtime'] <=> $a['mtime'];
+    });
+
+    if ($limit > 0 && count($items) > $limit) {
+        $items = array_slice($items, 0, $limit);
+    }
+
+    return $items;
+}
+
+function rdv_backup_retention_settings(array $config): array
+{
+    $settings = [];
+    if (isset($config['backups']) && is_array($config['backups'])) {
+        $settings = $config['backups']['config'] ?? [];
+    }
+    if (!is_array($settings)) {
+        $settings = [];
+    }
+
+    $keepLast = (int) ($settings['keep_last'] ?? 30);
+    if ($keepLast < 1) {
+        $keepLast = 1;
+    }
+    if ($keepLast > 1000) {
+        $keepLast = 1000;
+    }
+
+    $maxAgeDays = (int) ($settings['max_age_days'] ?? 0);
+    if ($maxAgeDays < 0) {
+        $maxAgeDays = 0;
+    }
+    if ($maxAgeDays > 3650) {
+        $maxAgeDays = 3650;
+    }
+
+    $autoPrune = true;
+    if (array_key_exists('auto_prune', $settings)) {
+        $autoPrune = !empty($settings['auto_prune']);
+    }
+
+    return [
+        'keep_last' => $keepLast,
+        'max_age_days' => $maxAgeDays,
+        'auto_prune' => $autoPrune,
+    ];
+}
+
+function rdv_prune_config_backups(?string $configFile = null, ?array $settings = null): array
+{
+    if ($settings === null) {
+        $settings = rdv_backup_retention_settings($GLOBALS['config'] ?? []);
+    }
+
+    $keepLast = max(1, (int) ($settings['keep_last'] ?? 30));
+    $maxAgeDays = max(0, (int) ($settings['max_age_days'] ?? 0));
+    $backups = rdv_list_config_backups($configFile, 0);
+    if (!$backups) {
+        return ['removed' => 0, 'failed' => 0];
+    }
+
+    $deleteMap = [];
+    if ($keepLast > 0 && count($backups) > $keepLast) {
+        foreach (array_slice($backups, $keepLast) as $item) {
+            if (!empty($item['path'])) {
+                $deleteMap[(string) $item['path']] = true;
+            }
+        }
+    }
+
+    if ($maxAgeDays > 0) {
+        $cutoff = time() - ($maxAgeDays * 86400);
+        foreach ($backups as $item) {
+            $mtime = (int) ($item['mtime'] ?? 0);
+            if ($mtime > 0 && $mtime < $cutoff && !empty($item['path'])) {
+                $deleteMap[(string) $item['path']] = true;
+            }
+        }
+    }
+
+    if (!$deleteMap) {
+        return ['removed' => 0, 'failed' => 0];
+    }
+
+    $removed = 0;
+    $failed = 0;
+    foreach (array_keys($deleteMap) as $path) {
+        if (@unlink($path)) {
+            $removed++;
+        } else {
+            $failed++;
+        }
+    }
+
+    return ['removed' => $removed, 'failed' => $failed];
+}
+
+function rdv_resolve_config_backup_file(string $backupName, ?string $configFile = null): string
+{
+    $name = trim($backupName);
+    if ($name === '' || basename($name) !== $name) {
+        throw new RuntimeException('Invalid backup name.');
+    }
+    if (!preg_match('/^config-\d{8}-\d{6}-[a-f0-9]{8}\.php$/i', $name)) {
+        throw new RuntimeException('Backup filename format is invalid.');
+    }
+
+    $path = rtrim(rdv_config_backup_dir($configFile), '/') . '/' . $name;
+    if (!is_file($path) || !is_readable($path)) {
+        throw new RuntimeException('Backup file was not found.');
+    }
+
+    return $path;
+}
+
+function rdv_snapshot_sanitize(array $config, bool $includeSecrets): array
+{
+    if ($includeSecrets) {
+        return $config;
+    }
+
+    $out = $config;
+    $mask = '***redacted***';
+
+    if (isset($out['database']) && is_array($out['database']) && array_key_exists('password', $out['database'])) {
+        $out['database']['password'] = $mask;
+    }
+    if (isset($out['admin']) && is_array($out['admin'])) {
+        if (array_key_exists('password_hash', $out['admin'])) {
+            $out['admin']['password_hash'] = $mask;
+        }
+        if (array_key_exists('password', $out['admin'])) {
+            $out['admin']['password'] = $mask;
+        }
+    }
+    if (isset($out['provision']) && is_array($out['provision']) && array_key_exists('shared_secret', $out['provision'])) {
+        $out['provision']['shared_secret'] = $mask;
+    }
+    if (isset($out['sso']) && is_array($out['sso']) && array_key_exists('secret', $out['sso'])) {
+        $out['sso']['secret'] = $mask;
+    }
+    if (isset($out['bookmarks']) && is_array($out['bookmarks']) && array_key_exists('shared_secret', $out['bookmarks'])) {
+        $out['bookmarks']['shared_secret'] = $mask;
+    }
+
+    return $out;
+}
+
+function rdv_parse_config_snapshot(string $raw): array
+{
+    $raw = trim($raw);
+    if ($raw === '') {
+        throw new RuntimeException('Snapshot JSON cannot be empty.');
+    }
+
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        throw new RuntimeException('Snapshot JSON is invalid.');
+    }
+
+    $config = $decoded;
+    if (isset($decoded['config']) && is_array($decoded['config'])) {
+        $config = $decoded['config'];
+    }
+
+    if (!is_array($config)) {
+        throw new RuntimeException('Snapshot must contain a config object.');
+    }
+
+    if (empty($config['database']) || !is_array($config['database']) || empty($config['database']['dsn'])) {
+        throw new RuntimeException('Snapshot is missing database.dsn.');
+    }
+
+    foreach (['log', 'files', 'security', 'provision', 'sso', 'locale', 'admin', 'bookmarks', 'endpoints'] as $section) {
+        if (!isset($config[$section]) || !is_array($config[$section])) {
+            $config[$section] = [];
+        }
+    }
+
+    return $config;
+}
+
+function rdv_restore_redacted_secrets(array $incoming, array $current): array
+{
+    $mask = '***redacted***';
+    $secretPaths = [
+        ['database', 'password'],
+        ['admin', 'password_hash'],
+        ['admin', 'password'],
+        ['provision', 'shared_secret'],
+        ['sso', 'secret'],
+        ['bookmarks', 'shared_secret'],
+    ];
+
+    foreach ($secretPaths as $path) {
+        [$section, $key] = $path;
+        if (!isset($incoming[$section]) || !is_array($incoming[$section]) || !array_key_exists($key, $incoming[$section])) {
+            continue;
+        }
+
+        if ((string) $incoming[$section][$key] !== $mask) {
+            continue;
+        }
+
+        if (isset($current[$section]) && is_array($current[$section]) && array_key_exists($key, $current[$section])) {
+            $incoming[$section][$key] = $current[$section][$key];
+        } else {
+            $incoming[$section][$key] = '';
+        }
+    }
+
+    return $incoming;
+}
+
+function rdv_flatten_snapshot_value($value, string $prefix, array &$out): void
+{
+    if (is_array($value)) {
+        if ($prefix !== '') {
+            $out[$prefix] = '[array]';
+        }
+        if ($value === [] && $prefix !== '') {
+            $out[$prefix] = '[]';
+        }
+
+        foreach ($value as $key => $child) {
+            $path = $prefix === '' ? (string) $key : ($prefix . '.' . (string) $key);
+            rdv_flatten_snapshot_value($child, $path, $out);
+        }
+        return;
+    }
+
+    $encoded = json_encode($value, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    $out[$prefix] = $encoded === false ? (string) $value : $encoded;
+}
+
+function rdv_snapshot_diff_summary(array $current, array $incoming, int $maxRows = 200): array
+{
+    $left = [];
+    $right = [];
+    rdv_flatten_snapshot_value($current, '', $left);
+    rdv_flatten_snapshot_value($incoming, '', $right);
+    unset($left[''], $right['']);
+
+    $keys = array_values(array_unique(array_merge(array_keys($left), array_keys($right))));
+    sort($keys, SORT_STRING);
+
+    $rows = [];
+    $total = 0;
+    foreach ($keys as $key) {
+        $hasLeft = array_key_exists($key, $left);
+        $hasRight = array_key_exists($key, $right);
+        $leftVal = $hasLeft ? $left[$key] : '';
+        $rightVal = $hasRight ? $right[$key] : '';
+
+        if ($hasLeft && $hasRight && $leftVal === $rightVal) {
+            continue;
+        }
+
+        $status = 'changed';
+        if (!$hasLeft && $hasRight) {
+            $status = 'added';
+        } elseif ($hasLeft && !$hasRight) {
+            $status = 'removed';
+        }
+
+        $total++;
+        if (count($rows) < $maxRows) {
+            $rows[] = [
+                'path' => $key,
+                'status' => $status,
+                'current' => $leftVal,
+                'incoming' => $rightVal,
+            ];
+        }
+    }
+
+    return [
+        'rows' => $rows,
+        'total' => $total,
+        'truncated' => $total > $maxRows,
+    ];
+}
+
+function rdv_generate_secret(int $bytes = 32): string
+{
+    try {
+        return bin2hex(random_bytes(max(16, $bytes)));
+    } catch (\Throwable $e) {
+        return hash('sha256', uniqid('rounddav-admin', true) . microtime(true));
     }
 }
 
 function rdv_apply_config_updates(array $config, array $input): array
 {
-    foreach (['log', 'files', 'security', 'provision', 'sso', 'locale', 'admin'] as $section) {
+    foreach (['log', 'files', 'security', 'provision', 'sso', 'locale', 'admin', 'bookmarks', 'endpoints'] as $section) {
         if (!isset($config[$section]) || !is_array($config[$section])) {
             $config[$section] = [];
         }
     }
     if (!isset($config['security']['rate_limit']) || !is_array($config['security']['rate_limit'])) {
         $config['security']['rate_limit'] = [];
+    }
+    if (!isset($config['security']['headers']) || !is_array($config['security']['headers'])) {
+        $config['security']['headers'] = [];
+    }
+    if (!isset($config['security']['headers']['csp']) || !is_array($config['security']['headers']['csp'])) {
+        $config['security']['headers']['csp'] = [];
     }
 
     $config['debug']   = !empty($input['debug']);
@@ -651,25 +1228,79 @@ function rdv_apply_config_updates(array $config, array $input): array
     }
     $config['files']['allow_public_links'] = !empty($input['files_allow_public_links']);
     $config['files']['default_quota_mb']   = max(0, (int) ($input['files_default_quota'] ?? 0));
+    $policy = strtolower(trim((string) ($input['files_shared_write_policy'] ?? 'admins_only')));
+    $config['files']['shared_write_policy'] = $policy === 'authenticated_users' ? 'authenticated_users' : 'admins_only';
 
     $config['security']['rate_limit']['enabled']      = !empty($input['rate_limit_enabled']);
     $config['security']['rate_limit']['max_requests'] = max(1, (int) ($input['rate_limit_max'] ?? 100));
     $config['security']['rate_limit']['window_sec']   = max(1, (int) ($input['rate_limit_window'] ?? 60));
     $config['security']['rate_limit']['block_minutes'] = max(1, (int) ($input['rate_limit_block'] ?? 5));
+    $config['security']['trust_proxy_headers']        = !empty($input['trust_proxy_headers']);
+
+    $headers = &$config['security']['headers'];
+    $headers['enabled'] = !empty($input['headers_enabled']);
+    $headers['x_content_type_options'] = !empty($input['headers_nosniff']);
+    $headers['referrer_policy'] = trim((string) ($input['headers_referrer_policy'] ?? 'strict-origin-when-cross-origin'));
+    $headers['permissions_policy'] = trim((string) ($input['headers_permissions_policy'] ?? ''));
+
+    $xfo = strtoupper(trim((string) ($input['headers_x_frame_options'] ?? '')));
+    if (!in_array($xfo, ['', 'SAMEORIGIN', 'DENY'], true)) {
+        $xfo = '';
+    }
+    $headers['x_frame_options'] = $xfo;
+
+    $headers['csp']['enabled'] = !empty($input['headers_csp_enabled']);
+    $headers['csp']['policy'] = trim((string) ($input['headers_csp_policy'] ?? ''));
+
+    $ancestorsRaw = trim((string) ($input['headers_csp_frame_ancestors'] ?? "'self'"));
+    $ancestors = preg_split('/[\r\n,]+/', $ancestorsRaw) ?: [];
+    $ancestorsOut = [];
+    foreach ($ancestors as $item) {
+        $token = trim((string) $item);
+        if ($token === '') {
+            continue;
+        }
+        if (strcasecmp($token, 'self') === 0) {
+            $token = "'self'";
+        }
+        $ancestorsOut[] = $token;
+    }
+    if (!$ancestorsOut) {
+        $ancestorsOut = ["'self'"];
+    }
+    $headers['csp']['frame_ancestors'] = array_values(array_unique($ancestorsOut));
 
     $config['provision']['baseurl']          = trim((string) ($input['provision_baseurl'] ?? ($config['provision']['baseurl'] ?? '')));
     $config['provision']['principal_prefix'] = trim((string) ($input['provision_principal_prefix'] ?? ($config['provision']['principal_prefix'] ?? 'principals')));
+    if (!empty($input['generate_provision_secret'])) {
+        $config['provision']['shared_secret'] = rdv_generate_secret();
+    } else {
+        $provisionSecret = trim((string) ($input['provision_shared_secret'] ?? ''));
+        if ($provisionSecret !== '') {
+            $config['provision']['shared_secret'] = $provisionSecret;
+        }
+    }
 
     $config['sso']['enabled'] = !empty($input['sso_enabled']);
     $config['sso']['ttl']     = max(60, (int) ($input['sso_ttl'] ?? 600));
-    if (isset($input['sso_secret'])) {
+    if (!empty($input['generate_sso_secret'])) {
+        $config['sso']['secret'] = rdv_generate_secret();
+    } elseif (isset($input['sso_secret'])) {
         $ssoSecret = trim((string) $input['sso_secret']);
         if ($ssoSecret !== '') {
             $config['sso']['secret'] = $ssoSecret;
         }
     }
 
+    if (!empty($input['generate_bookmark_secret'])) {
+        $config['bookmarks']['shared_secret'] = rdv_generate_secret();
+    } elseif (array_key_exists('bookmarks_shared_secret', $input)) {
+        $bookmarkSecret = trim((string) $input['bookmarks_shared_secret']);
+        $config['bookmarks']['shared_secret'] = $bookmarkSecret;
+    }
+
     $config['locale']['default'] = trim((string) ($input['locale_default'] ?? ($config['locale']['default'] ?? 'en_US')));
+    $config['endpoints']['enable_testdav'] = !empty($input['endpoint_enable_testdav']);
 
     $adminUser = trim((string) ($input['admin_username'] ?? ''));
     if ($adminUser !== '') {
@@ -687,14 +1318,377 @@ function rdv_apply_config_updates(array $config, array $input): array
     return $config;
 }
 
+function rdv_security_headers_diagnostics(array $config): array
+{
+    $headers = (array) ($config['security']['headers'] ?? []);
+    $csp = (array) ($headers['csp'] ?? []);
+
+    $enabled = !array_key_exists('enabled', $headers) || !empty($headers['enabled']);
+    $nosniff = !array_key_exists('x_content_type_options', $headers) || !empty($headers['x_content_type_options']);
+    $referrerPolicy = trim((string) ($headers['referrer_policy'] ?? 'strict-origin-when-cross-origin'));
+    $permissionsPolicy = trim((string) ($headers['permissions_policy'] ?? 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'));
+    $xfo = strtoupper(trim((string) ($headers['x_frame_options'] ?? '')));
+    if (!in_array($xfo, ['', 'SAMEORIGIN', 'DENY'], true)) {
+        $xfo = '';
+    }
+
+    $cspEnabled = !empty($csp['enabled']);
+    $cspPolicy = trim((string) ($csp['policy'] ?? ''));
+    $ancestors = $csp['frame_ancestors'] ?? ["'self'"];
+    if (is_string($ancestors)) {
+        $ancestors = preg_split('/[\r\n,]+/', $ancestors) ?: [];
+    }
+    if (!is_array($ancestors)) {
+        $ancestors = ["'self'"];
+    }
+    $frameAncestors = [];
+    foreach ($ancestors as $item) {
+        $token = trim((string) $item);
+        if ($token !== '') {
+            $frameAncestors[] = $token;
+        }
+    }
+    if (!$frameAncestors) {
+        $frameAncestors = ["'self'"];
+    }
+
+    $warnings = [];
+    if (!$enabled) {
+        $warnings[] = 'Security headers are globally disabled.';
+    }
+    if ($xfo !== '') {
+        $warnings[] = 'X-Frame-Options is set (' . $xfo . '), which can block Roundcube iframe embedding on different origins.';
+    }
+    if ($cspEnabled && $cspPolicy !== '') {
+        $policyLower = strtolower($cspPolicy);
+        if (strpos($policyLower, 'frame-ancestors') === false) {
+            $warnings[] = 'Custom CSP policy is active without an explicit frame-ancestors directive.';
+        } elseif (strpos($policyLower, 'frame-ancestors') !== false && strpos($policyLower, 'https://') === false && strpos($policyLower, "'self'") !== false) {
+            $warnings[] = 'Custom CSP appears self-only; cross-origin Roundcube embedding may fail.';
+        }
+    } elseif ($cspEnabled) {
+        $hasExternalAncestor = false;
+        foreach ($frameAncestors as $token) {
+            if (preg_match('#^https?://#i', $token)) {
+                $hasExternalAncestor = true;
+                break;
+            }
+        }
+        if (!$hasExternalAncestor) {
+            $warnings[] = 'CSP frame-ancestors currently has no explicit external origin. Add your Roundcube URL for cross-origin embedding.';
+        }
+    }
+    if ($permissionsPolicy === '') {
+        $warnings[] = 'Permissions-Policy header is disabled.';
+    }
+
+    $crossOriginProfile = implode("\n", [
+        "security.headers.enabled = true",
+        "security.headers.x_content_type_options = true",
+        "security.headers.referrer_policy = strict-origin-when-cross-origin",
+        "security.headers.permissions_policy = camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        "security.headers.x_frame_options = (empty)",
+        "security.headers.csp.enabled = true",
+        "security.headers.csp.policy = (empty)",
+        "security.headers.csp.frame_ancestors = 'self', https://mail.example.com",
+    ]);
+
+    $sameOriginProfile = implode("\n", [
+        "security.headers.enabled = true",
+        "security.headers.x_content_type_options = true",
+        "security.headers.referrer_policy = strict-origin-when-cross-origin",
+        "security.headers.permissions_policy = camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+        "security.headers.x_frame_options = SAMEORIGIN",
+        "security.headers.csp.enabled = true",
+        "security.headers.csp.policy = (empty)",
+        "security.headers.csp.frame_ancestors = 'self'",
+    ]);
+
+    return [
+        'enabled' => $enabled,
+        'nosniff' => $nosniff,
+        'referrer_policy' => $referrerPolicy,
+        'permissions_policy' => $permissionsPolicy,
+        'x_frame_options' => $xfo === '' ? '(disabled)' : $xfo,
+        'csp_enabled' => $cspEnabled,
+        'csp_policy_override' => $cspPolicy !== '' ? 'yes' : 'no',
+        'frame_ancestors' => implode(', ', $frameAncestors),
+        'warnings' => $warnings,
+        'profile_cross_origin' => $crossOriginProfile,
+        'profile_same_origin' => $sameOriginProfile,
+        'profile_cross_origin_fields' => [
+            'headers_enabled' => true,
+            'headers_nosniff' => true,
+            'headers_referrer_policy' => 'strict-origin-when-cross-origin',
+            'headers_permissions_policy' => 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+            'headers_x_frame_options' => '',
+            'headers_csp_enabled' => true,
+            'headers_csp_policy' => '',
+            'headers_csp_frame_ancestors' => "'self'\nhttps://mail.example.com",
+        ],
+        'profile_same_origin_fields' => [
+            'headers_enabled' => true,
+            'headers_nosniff' => true,
+            'headers_referrer_policy' => 'strict-origin-when-cross-origin',
+            'headers_permissions_policy' => 'camera=(), microphone=(), geolocation=(), payment=(), usb=()',
+            'headers_x_frame_options' => 'SAMEORIGIN',
+            'headers_csp_enabled' => true,
+            'headers_csp_policy' => '',
+            'headers_csp_frame_ancestors' => "'self'",
+        ],
+    ];
+}
+
+function rdv_expected_security_headers(array $config): array
+{
+    $headersCfg = (array) ($config['security']['headers'] ?? []);
+    if (array_key_exists('enabled', $headersCfg) && empty($headersCfg['enabled'])) {
+        return [];
+    }
+
+    $expected = [];
+
+    $sendNosniff = !array_key_exists('x_content_type_options', $headersCfg)
+        || !empty($headersCfg['x_content_type_options']);
+    if ($sendNosniff) {
+        $expected['x-content-type-options'] = 'nosniff';
+    }
+
+    $referrerPolicy = trim((string) ($headersCfg['referrer_policy'] ?? 'strict-origin-when-cross-origin'));
+    if ($referrerPolicy !== '') {
+        $expected['referrer-policy'] = $referrerPolicy;
+    }
+
+    $permissionsPolicy = trim((string) ($headersCfg['permissions_policy'] ?? 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'));
+    if ($permissionsPolicy !== '') {
+        $expected['permissions-policy'] = $permissionsPolicy;
+    }
+
+    $xfo = strtoupper(trim((string) ($headersCfg['x_frame_options'] ?? '')));
+    if (in_array($xfo, ['SAMEORIGIN', 'DENY'], true)) {
+        $expected['x-frame-options'] = $xfo;
+    }
+
+    $cspCfg = (array) ($headersCfg['csp'] ?? []);
+    if (!empty($cspCfg['enabled'])) {
+        $policy = trim((string) ($cspCfg['policy'] ?? ''));
+
+        if ($policy === '') {
+            $ancestors = $cspCfg['frame_ancestors'] ?? ["'self'"];
+            if (is_string($ancestors)) {
+                $ancestors = preg_split('/[\s,;]+/', $ancestors) ?: [];
+            }
+            if (!is_array($ancestors) || !$ancestors) {
+                $ancestors = ["'self'"];
+            }
+
+            $tokens = [];
+            foreach ($ancestors as $item) {
+                $token = trim((string) $item);
+                if ($token === '') {
+                    continue;
+                }
+                if (strtolower($token) === 'self') {
+                    $token = "'self'";
+                }
+                $tokens[] = $token;
+            }
+            if (!$tokens) {
+                $tokens = ["'self'"];
+            }
+
+            $policy = "default-src 'self'; "
+                . "img-src 'self' data: blob:; "
+                . "style-src 'self' 'unsafe-inline'; "
+                . "script-src 'self' 'unsafe-inline'; "
+                . "frame-ancestors " . implode(' ', $tokens);
+        }
+
+        $expected['content-security-policy'] = $policy;
+    }
+
+    return $expected;
+}
+
 function rdv_redirect_action(string $requested): string
 {
     $allowed = ['sharing', 'sharing_calendar', 'sharing_addressbook', 'sharing_bookmarks', 'sharing_files'];
     return in_array($requested, $allowed, true) ? $requested : 'sharing';
 }
 
+function rdv_rate_limit_dir(): string
+{
+    return dirname(RDV_CONFIG_FILE) . '/../var/rate_limit';
+}
+
+function rdv_apply_rate_limit_updates(array $config, array $input): array
+{
+    if (!isset($config['security']) || !is_array($config['security'])) {
+        $config['security'] = [];
+    }
+    if (!isset($config['security']['rate_limit']) || !is_array($config['security']['rate_limit'])) {
+        $config['security']['rate_limit'] = [];
+    }
+
+    $config['security']['rate_limit']['enabled'] = !empty($input['rate_limit_enabled']);
+    $config['security']['rate_limit']['max_requests'] = max(1, (int) ($input['rate_limit_max'] ?? 100));
+    $config['security']['rate_limit']['window_sec'] = max(1, (int) ($input['rate_limit_window'] ?? 300));
+    $config['security']['rate_limit']['block_minutes'] = max(1, (int) ($input['rate_limit_block'] ?? 30));
+
+    $rawAllowlist = (string) ($input['rate_limit_ip_allowlist'] ?? '');
+    $allowlist = preg_split('/[\s,;]+/', strtolower($rawAllowlist)) ?: [];
+    $allowlist = array_values(array_unique(array_filter(array_map('trim', $allowlist), function ($value) {
+        return $value !== '';
+    })));
+    $config['security']['rate_limit']['ip_allowlist'] = $allowlist;
+
+    $scopes = ['dav', 'api', 'admin', 'files', 'files_attach'];
+    $scopeInput = isset($input['scope']) && is_array($input['scope']) ? $input['scope'] : [];
+    $overrides = [];
+    foreach ($scopes as $scope) {
+        $row = isset($scopeInput[$scope]) && is_array($scopeInput[$scope]) ? $scopeInput[$scope] : [];
+        $overrides[$scope] = [
+            'enabled'       => !empty($row['enabled']),
+            'max_requests'  => max(1, (int) ($row['max_requests'] ?? $config['security']['rate_limit']['max_requests'])),
+            'window_sec'    => max(1, (int) ($row['window_sec'] ?? $config['security']['rate_limit']['window_sec'])),
+            'block_minutes' => max(1, (int) ($row['block_minutes'] ?? $config['security']['rate_limit']['block_minutes'])),
+        ];
+    }
+    $config['security']['rate_limit']['scope_overrides'] = $overrides;
+
+    return $config;
+}
+
+function rdv_list_rate_limit_entries(array $config, int $max = 300): array
+{
+    $dir = rdv_rate_limit_dir();
+    if (!is_dir($dir)) {
+        return [];
+    }
+
+    $now = time();
+
+    $files = glob($dir . '/*.json') ?: [];
+    $entries = [];
+
+    foreach ($files as $file) {
+        if (!is_file($file)) {
+            continue;
+        }
+
+        $raw = @file_get_contents($file);
+        $data = json_decode((string) $raw, true);
+        if (!is_array($data)) {
+            continue;
+        }
+
+        $scope = strtolower((string) ($data['scope'] ?? 'unknown'));
+        if ($scope === 'unknown') {
+            $base = basename($file, '.json');
+            $parts = explode('_', $base, 2);
+            if (!empty($parts[0])) {
+                $scope = strtolower((string) $parts[0]);
+            }
+        }
+        $policy = rdv_rate_limit_scope_policy($config, $scope);
+        $window = max(1, (int) ($policy['window_sec'] ?? 300));
+        $limit = max(1, (int) ($policy['max_requests'] ?? 100));
+
+        $ip = trim((string) ($data['ip'] ?? 'unknown'));
+        $windowStart = (int) ($data['window_start'] ?? 0);
+        $count = max(0, (int) ($data['count'] ?? 0));
+        $blockedUntil = (int) ($data['blocked_until'] ?? 0);
+        $updatedAt = (int) ($data['updated_at'] ?? @filemtime($file) ?: 0);
+
+        $isBlocked = $blockedUntil > $now;
+        $resetAt = $isBlocked ? $blockedUntil : ($windowStart > 0 ? ($windowStart + $window) : ($now + $window));
+        $remaining = $isBlocked ? 0 : max(0, $limit - $count);
+
+        $entries[] = [
+            'scope'        => $scope,
+            'ip'           => $ip,
+            'count'        => $count,
+            'remaining'    => $remaining,
+            'limit'        => $limit,
+            'window_sec'   => $window,
+            'window_start' => $windowStart,
+            'blocked_until'=> $blockedUntil,
+            'is_blocked'   => $isBlocked,
+            'reset_at'     => $resetAt,
+            'updated_at'   => $updatedAt,
+        ];
+    }
+
+    usort($entries, function (array $a, array $b): int {
+        if ($a['is_blocked'] !== $b['is_blocked']) {
+            return $a['is_blocked'] ? -1 : 1;
+        }
+
+        return ($b['updated_at'] <=> $a['updated_at']);
+    });
+
+    if (count($entries) > $max) {
+        $entries = array_slice($entries, 0, $max);
+    }
+
+    return $entries;
+}
+
+function rdv_rate_limit_scope_policy(array $config, string $scope): array
+{
+    $rate = (array) ($config['security']['rate_limit'] ?? []);
+    $policy = [
+        'enabled'       => !empty($rate['enabled']),
+        'max_requests'  => max(1, (int) ($rate['max_requests'] ?? 100)),
+        'window_sec'    => max(1, (int) ($rate['window_sec'] ?? 300)),
+        'block_minutes' => max(1, (int) ($rate['block_minutes'] ?? 30)),
+    ];
+
+    $overrides = isset($rate['scope_overrides']) && is_array($rate['scope_overrides']) ? $rate['scope_overrides'] : [];
+    $key = strtolower(trim($scope));
+    if ($key !== '' && isset($overrides[$key]) && is_array($overrides[$key])) {
+        $ovr = $overrides[$key];
+        if (array_key_exists('enabled', $ovr)) {
+            $policy['enabled'] = !empty($ovr['enabled']);
+        }
+        if (array_key_exists('max_requests', $ovr)) {
+            $policy['max_requests'] = max(1, (int) $ovr['max_requests']);
+        }
+        if (array_key_exists('window_sec', $ovr)) {
+            $policy['window_sec'] = max(1, (int) $ovr['window_sec']);
+        }
+        if (array_key_exists('block_minutes', $ovr)) {
+            $policy['block_minutes'] = max(1, (int) $ovr['block_minutes']);
+        }
+    }
+
+    return $policy;
+}
+
+function rdv_reset_rate_limit_store(): int
+{
+    $dir = rdv_rate_limit_dir();
+    if (!is_dir($dir)) {
+        return 0;
+    }
+
+    $files = glob($dir . '/*.json') ?: [];
+    $removed = 0;
+    foreach ($files as $file) {
+        if (is_file($file) && @unlink($file)) {
+            $removed++;
+        }
+    }
+
+    return $removed;
+}
+
 $action = $_GET['action'] ?? 'dashboard';
 $error  = null;
+
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    rdv_require_safe_post_request();
+}
 
 // Handle login/logout early
 if ($action === 'do_login') {
@@ -705,6 +1699,7 @@ if ($action === 'do_login') {
         !empty($adminCfg['password_hash']) &&
         password_verify($pass, $adminCfg['password_hash'])
     ) {
+        session_regenerate_id(true);
         $_SESSION['rounddav_admin'] = $user;
         header('Location: ?action=dashboard');
         exit;
@@ -919,12 +1914,38 @@ if (in_array($action, ['create_calendar', 'delete_calendar', 'update_calendar', 
         $error  = $e->getMessage();
         $action = 'sharing_files';
     }
+} elseif ($action === 'update_rate_limit') {
+    rdv_require_admin();
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+        try {
+            $config = rdv_apply_rate_limit_updates($config, $_POST);
+            rdv_write_config_file($config, RDV_CONFIG_FILE);
+            header('Location: ?action=dashboard&rate_saved=1');
+            exit;
+        } catch (\Throwable $e) {
+            $error  = $e->getMessage();
+            $action = 'dashboard';
+        }
+    } else {
+        header('Location: ?action=dashboard');
+        exit;
+    }
+} elseif ($action === 'reset_rate_limit') {
+    rdv_require_admin();
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+        $removed = rdv_reset_rate_limit_store();
+        header('Location: ?action=dashboard&rate_reset=' . $removed);
+        exit;
+    }
+    header('Location: ?action=dashboard');
+    exit;
 } elseif ($action === 'update_config') {
     rdv_require_admin();
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         try {
             $config = rdv_apply_config_updates($config, $_POST);
             rdv_write_config_file($config, RDV_CONFIG_FILE);
+            unset($_SESSION['rdv_config_import_preview']);
             header('Location: ?action=config&saved=1');
             exit;
         } catch (\Throwable $e) {
@@ -934,6 +1955,273 @@ if (in_array($action, ['create_calendar', 'delete_calendar', 'update_calendar', 
     } else {
         header('Location: ?action=config');
         exit;
+    }
+} elseif ($action === 'export_config_snapshot') {
+    rdv_require_admin();
+    $includeSecrets = !empty($_POST['include_secrets']);
+    $payload = [
+        'generated_at' => date('c'),
+        'generated_by' => (string) ($_SESSION['rounddav_admin'] ?? ''),
+        'include_secrets' => $includeSecrets,
+        'config' => rdv_snapshot_sanitize($config, $includeSecrets),
+    ];
+
+    $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (!is_string($json)) {
+        throw new RuntimeException('Unable to encode snapshot JSON.');
+    }
+
+    header('Content-Type: application/json; charset=utf-8');
+    header('Content-Disposition: attachment; filename="rounddav-config-snapshot-' . date('Ymd-His') . '.json"');
+    echo $json;
+    exit;
+} elseif ($action === 'preview_config_snapshot') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        $raw = (string) ($_POST['snapshot_json'] ?? '');
+        $incoming = rdv_parse_config_snapshot($raw);
+        $incoming = rdv_restore_redacted_secrets($incoming, $config);
+        $diff = rdv_snapshot_diff_summary($config, $incoming, 200);
+        $_SESSION['rdv_config_import_preview'] = [
+            'created_at' => time(),
+            'diff' => $diff,
+            'config' => $incoming,
+        ];
+        header('Location: ?action=config&import_preview=1');
+        exit;
+    } catch (\Throwable $e) {
+        $error = $e->getMessage();
+        $action = 'config';
+    }
+} elseif ($action === 'apply_config_snapshot') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        $preview = $_SESSION['rdv_config_import_preview'] ?? null;
+        if (!is_array($preview) || empty($preview['config']) || !is_array($preview['config'])) {
+            throw new RuntimeException('No import preview is available.');
+        }
+
+        $createdAt = (int) ($preview['created_at'] ?? 0);
+        if ($createdAt > 0 && (time() - $createdAt) > 3600) {
+            unset($_SESSION['rdv_config_import_preview']);
+            throw new RuntimeException('Import preview expired. Please preview the snapshot again.');
+        }
+
+        $config = $preview['config'];
+        rdv_write_config_file($config, RDV_CONFIG_FILE);
+        unset($_SESSION['rdv_config_import_preview']);
+        header('Location: ?action=config&saved=1&imported=1');
+        exit;
+    } catch (\Throwable $e) {
+        $error = $e->getMessage();
+        $action = 'config';
+    }
+} elseif ($action === 'cancel_config_snapshot') {
+    rdv_require_admin();
+    unset($_SESSION['rdv_config_import_preview']);
+    header('Location: ?action=config');
+    exit;
+} elseif ($action === 'create_config_backup') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        $backupPath = rdv_backup_config_file(RDV_CONFIG_FILE);
+        if ($backupPath === null) {
+            throw new RuntimeException('No config.php exists to back up yet.');
+        }
+        $settings = rdv_backup_retention_settings($config);
+        $removed = 0;
+        if (!empty($settings['auto_prune'])) {
+            $result = rdv_prune_config_backups(RDV_CONFIG_FILE, $settings);
+            $removed = (int) ($result['removed'] ?? 0);
+        }
+        header('Location: ?action=config&backup_created=' . rawurlencode(basename($backupPath)) . '&backup_pruned=' . $removed);
+        exit;
+    } catch (\Throwable $e) {
+        $error = $e->getMessage();
+        $action = 'config';
+    }
+} elseif ($action === 'download_config_backup') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        $backupName = (string) ($_POST['backup_name'] ?? '');
+        $backupPath = rdv_resolve_config_backup_file($backupName, RDV_CONFIG_FILE);
+        header('Content-Type: application/x-php; charset=utf-8');
+        header('Content-Length: ' . (string) (@filesize($backupPath) ?: 0));
+        header('Content-Disposition: attachment; filename="' . basename($backupPath) . '"');
+        readfile($backupPath);
+        exit;
+    } catch (\Throwable $e) {
+        $error = $e->getMessage();
+        $action = 'config';
+    }
+} elseif ($action === 'download_all_config_backups') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        if (!class_exists('ZipArchive')) {
+            throw new RuntimeException('ZipArchive extension is required to download all backups.');
+        }
+
+        $items = rdv_list_config_backups(RDV_CONFIG_FILE, 0);
+        if (!$items) {
+            throw new RuntimeException('No config backups are available.');
+        }
+
+        $tmpZip = tempnam(sys_get_temp_dir(), 'rdvcfgzip-');
+        if (!is_string($tmpZip) || $tmpZip === '') {
+            throw new RuntimeException('Unable to create temporary archive file.');
+        }
+        @unlink($tmpZip);
+        $tmpZip .= '.zip';
+
+        $zip = new ZipArchive();
+        if ($zip->open($tmpZip, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) {
+            throw new RuntimeException('Unable to open ZIP archive for writing.');
+        }
+
+        foreach ($items as $item) {
+            $path = (string) ($item['path'] ?? '');
+            $name = (string) ($item['name'] ?? '');
+            if ($path === '' || $name === '' || !is_file($path)) {
+                continue;
+            }
+            if (!$zip->addFile($path, $name)) {
+                throw new RuntimeException('Unable to add backup to ZIP archive: ' . $name);
+            }
+        }
+
+        $zip->close();
+        if (!is_file($tmpZip)) {
+            throw new RuntimeException('Failed to finalize ZIP archive.');
+        }
+
+        header('Content-Type: application/zip');
+        header('Content-Length: ' . (string) (@filesize($tmpZip) ?: 0));
+        header('Content-Disposition: attachment; filename="rounddav-config-backups-' . date('Ymd-His') . '.zip"');
+        readfile($tmpZip);
+        @unlink($tmpZip);
+        exit;
+    } catch (\Throwable $e) {
+        if (isset($tmpZip) && is_string($tmpZip) && $tmpZip !== '' && is_file($tmpZip)) {
+            @unlink($tmpZip);
+        }
+        $error = $e->getMessage();
+        $action = 'config';
+    }
+} elseif ($action === 'restore_config_backup') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        $backupName = (string) ($_POST['backup_name'] ?? '');
+        $backupPath = rdv_resolve_config_backup_file($backupName, RDV_CONFIG_FILE);
+        rdv_backup_config_file(RDV_CONFIG_FILE);
+        $restored = @copy($backupPath, RDV_CONFIG_FILE);
+        if (!$restored) {
+            throw new RuntimeException('Unable to restore selected backup.');
+        }
+
+        $settings = rdv_backup_retention_settings($config);
+        $removed = 0;
+        if (!empty($settings['auto_prune'])) {
+            $result = rdv_prune_config_backups(RDV_CONFIG_FILE, $settings);
+            $removed = (int) ($result['removed'] ?? 0);
+        }
+
+        unset($_SESSION['rdv_config_import_preview']);
+        header('Location: ?action=config&saved=1&restored=' . rawurlencode(basename($backupPath)) . '&backup_pruned=' . $removed);
+        exit;
+    } catch (\Throwable $e) {
+        $error = $e->getMessage();
+        $action = 'config';
+    }
+} elseif ($action === 'update_backup_retention') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        if (!isset($config['backups']) || !is_array($config['backups'])) {
+            $config['backups'] = [];
+        }
+        if (!isset($config['backups']['config']) || !is_array($config['backups']['config'])) {
+            $config['backups']['config'] = [];
+        }
+
+        $keepLast = (int) ($_POST['backup_keep_last'] ?? 30);
+        if ($keepLast < 1) {
+            $keepLast = 1;
+        }
+        if ($keepLast > 1000) {
+            $keepLast = 1000;
+        }
+
+        $maxAgeDays = (int) ($_POST['backup_max_age_days'] ?? 0);
+        if ($maxAgeDays < 0) {
+            $maxAgeDays = 0;
+        }
+        if ($maxAgeDays > 3650) {
+            $maxAgeDays = 3650;
+        }
+
+        $config['backups']['config']['keep_last'] = $keepLast;
+        $config['backups']['config']['max_age_days'] = $maxAgeDays;
+        $config['backups']['config']['auto_prune'] = !empty($_POST['backup_auto_prune']);
+
+        rdv_write_config_file($config, RDV_CONFIG_FILE);
+        unset($_SESSION['rdv_config_import_preview']);
+        header('Location: ?action=config&saved=1&backup_policy_saved=1');
+        exit;
+    } catch (\Throwable $e) {
+        $error = $e->getMessage();
+        $action = 'config';
+    }
+} elseif ($action === 'prune_config_backups') {
+    rdv_require_admin();
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        header('Location: ?action=config');
+        exit;
+    }
+
+    try {
+        $settings = rdv_backup_retention_settings($config);
+        $result = rdv_prune_config_backups(RDV_CONFIG_FILE, $settings);
+        $removed = (int) ($result['removed'] ?? 0);
+        $failed = (int) ($result['failed'] ?? 0);
+        header('Location: ?action=config&backup_pruned=' . $removed . '&backup_prune_failed=' . $failed);
+        exit;
+    } catch (\Throwable $e) {
+        $error = $e->getMessage();
+        $action = 'config';
     }
 }
 
@@ -1223,6 +2511,7 @@ if ($action === 'login' && !rdv_admin_logged_in()) {
   <div class="error"><?= rdv_html($error) ?></div>
 <?php endif; ?>
 <form method="post" action="?action=do_login">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
   <p>
     <label>Username<br>
       <input type="text" name="username">
@@ -1303,6 +2592,157 @@ if ($action === 'dashboard'): ?>
   </table>
 <?php endif; ?>
 
+<hr>
+<h2>Rate limits</h2>
+<p class="muted">
+  Live counters are read from <code><?= rdv_html(rdv_rate_limit_dir()) ?></code>.
+  Entries update as requests hit DAV/API/admin/files endpoints.
+</p>
+<?php
+  $rateCfg = $config['security']['rate_limit'] ?? [];
+  $rateScopes = ['dav', 'api', 'admin', 'files', 'files_attach'];
+  $scopeOverrides = isset($rateCfg['scope_overrides']) && is_array($rateCfg['scope_overrides']) ? $rateCfg['scope_overrides'] : [];
+  $allowlist = isset($rateCfg['ip_allowlist']) && is_array($rateCfg['ip_allowlist']) ? $rateCfg['ip_allowlist'] : [];
+  $allowlistText = implode("\n", $allowlist);
+  $rateEntries = rdv_list_rate_limit_entries($config, 300);
+  $blockedCount = 0;
+  foreach ($rateEntries as $entry) {
+      if (!empty($entry['is_blocked'])) {
+          $blockedCount++;
+      }
+  }
+  if (!empty($_GET['rate_saved'])): ?>
+  <div class="alert success">Rate-limit settings saved.</div>
+<?php endif; ?>
+<?php if (isset($_GET['rate_reset'])): ?>
+  <div class="alert success">
+    Cleared <?= (int) $_GET['rate_reset'] ?> limiter state file(s).
+  </div>
+<?php endif; ?>
+
+<div class="share-config">
+  <h3>Current policy</h3>
+  <p class="muted">
+    <strong>Status:</strong>
+    <?php if (!empty($rateCfg['enabled'])): ?>
+      <span class="pill pill-ok">Enabled</span>
+    <?php else: ?>
+      <span class="pill pill-bad">Disabled</span>
+    <?php endif; ?>
+    · <strong>Limit:</strong> <?= (int) ($rateCfg['max_requests'] ?? 100) ?>/<?= (int) ($rateCfg['window_sec'] ?? 300) ?>s
+    · <strong>Block:</strong> <?= (int) ($rateCfg['block_minutes'] ?? 30) ?> minute(s)
+    · <strong>Allowlisted IP rules:</strong> <?= count($allowlist) ?>
+    · <strong>Tracked entries:</strong> <?= count($rateEntries) ?>
+    · <strong>Blocked now:</strong> <?= $blockedCount ?>
+  </p>
+  <form method="post" action="?action=update_rate_limit">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+    <p>
+      <label>
+        <input type="checkbox" name="rate_limit_enabled" value="1" <?= !empty($rateCfg['enabled']) ? 'checked' : '' ?>>
+        Enable rate limiting
+      </label>
+    </p>
+    <p>
+      <label>Max requests
+        <input type="number" min="1" name="rate_limit_max" value="<?= (int) ($rateCfg['max_requests'] ?? 100) ?>">
+      </label>
+      <label style="margin-left:8px;">Window (seconds)
+        <input type="number" min="1" name="rate_limit_window" value="<?= (int) ($rateCfg['window_sec'] ?? 300) ?>">
+      </label>
+      <label style="margin-left:8px;">Block (minutes)
+        <input type="number" min="1" name="rate_limit_block" value="<?= (int) ($rateCfg['block_minutes'] ?? 30) ?>">
+      </label>
+    </p>
+    <p>
+      <label>IP allowlist (one IP or CIDR per line)<br>
+        <textarea name="rate_limit_ip_allowlist" rows="4" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;"><?= rdv_html($allowlistText) ?></textarea>
+      </label>
+      <span class="muted">Examples: <code>127.0.0.1</code>, <code>192.168.1.0/24</code>, <code>2001:db8::/32</code></span>
+    </p>
+    <p><strong>Per-scope overrides</strong></p>
+    <table>
+      <thead>
+        <tr>
+          <th>Scope</th>
+          <th>Enabled</th>
+          <th>Max requests</th>
+          <th>Window (sec)</th>
+          <th>Block (min)</th>
+        </tr>
+      </thead>
+      <tbody>
+      <?php foreach ($rateScopes as $scope): ?>
+        <?php
+          $scopeCfg = isset($scopeOverrides[$scope]) && is_array($scopeOverrides[$scope]) ? $scopeOverrides[$scope] : [];
+        ?>
+        <tr>
+          <td><code><?= rdv_html($scope) ?></code></td>
+          <td>
+            <input type="checkbox" name="scope[<?= rdv_html($scope) ?>][enabled]" value="1" <?= !empty($scopeCfg['enabled']) ? 'checked' : '' ?>>
+          </td>
+          <td>
+            <input type="number" min="1" name="scope[<?= rdv_html($scope) ?>][max_requests]" value="<?= (int) ($scopeCfg['max_requests'] ?? ($rateCfg['max_requests'] ?? 100)) ?>">
+          </td>
+          <td>
+            <input type="number" min="1" name="scope[<?= rdv_html($scope) ?>][window_sec]" value="<?= (int) ($scopeCfg['window_sec'] ?? ($rateCfg['window_sec'] ?? 300)) ?>">
+          </td>
+          <td>
+            <input type="number" min="1" name="scope[<?= rdv_html($scope) ?>][block_minutes]" value="<?= (int) ($scopeCfg['block_minutes'] ?? ($rateCfg['block_minutes'] ?? 30)) ?>">
+          </td>
+        </tr>
+      <?php endforeach; ?>
+      </tbody>
+    </table>
+    <p>
+      <button class="btn small" type="submit">Save rate limits</button>
+    </p>
+  </form>
+  <form method="post" action="?action=reset_rate_limit" onsubmit="return confirm('Clear all live rate-limit counters now?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+    <button class="btn small danger" type="submit">Clear live counters</button>
+  </form>
+</div>
+
+<?php if (!$rateEntries): ?>
+  <p class="muted">No live rate-limit entries yet.</p>
+<?php else: ?>
+  <table>
+    <thead>
+      <tr>
+        <th>Scope</th>
+        <th>Policy</th>
+        <th>Client IP</th>
+        <th>Status</th>
+        <th>Count</th>
+        <th>Remaining</th>
+        <th>Updated</th>
+        <th>Reset/Unblock</th>
+      </tr>
+    </thead>
+    <tbody>
+    <?php foreach ($rateEntries as $entry): ?>
+      <tr>
+        <td><code><?= rdv_html((string) $entry['scope']) ?></code></td>
+        <td><?= (int) $entry['limit'] ?>/<?= (int) ($entry['window_sec'] ?? 0) ?>s</td>
+        <td><code><?= rdv_html((string) $entry['ip']) ?></code></td>
+        <td>
+          <?php if (!empty($entry['is_blocked'])): ?>
+            <span class="pill pill-bad">Blocked</span>
+          <?php else: ?>
+            <span class="pill pill-ok">Active</span>
+          <?php endif; ?>
+        </td>
+        <td><?= (int) $entry['count'] ?> / <?= (int) $entry['limit'] ?></td>
+        <td><?= (int) $entry['remaining'] ?></td>
+        <td><?= $entry['updated_at'] ? rdv_html(date('Y-m-d H:i:s', (int) $entry['updated_at'])) : 'n/a' ?></td>
+        <td><?= $entry['reset_at'] ? rdv_html(date('Y-m-d H:i:s', (int) $entry['reset_at'])) : 'n/a' ?></td>
+      </tr>
+    <?php endforeach; ?>
+    </tbody>
+  </table>
+<?php endif; ?>
+
 <?php
 // View a single principal
 elseif ($action === 'view_user'):
@@ -1346,6 +2786,7 @@ elseif ($action === 'view_user'):
           <td><?= rdv_html((string) $c['uri']) ?></td>
           <td>
             <form class="inline" method="post" action="?action=update_calendar">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
               <input type="hidden" name="instance_id" value="<?= (int) $c['id'] ?>">
               <input type="hidden" name="principal_id" value="<?= (int) $principal['id'] ?>">
               <input type="text" name="displayname" value="<?= rdv_html((string) $c['displayname']) ?>" size="16">
@@ -1377,6 +2818,7 @@ elseif ($action === 'view_user'):
             </form>
             <form class="inline" method="post" action="?action=delete_calendar"
                   onsubmit="return confirm('Delete this calendar (and all its events)?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
               <input type="hidden" name="instance_id" value="<?= (int) $c['id'] ?>">
               <input type="hidden" name="principal_id" value="<?= (int) $principal['id'] ?>">
               <button class="btn small danger" type="submit">Delete</button>
@@ -1389,6 +2831,7 @@ elseif ($action === 'view_user'):
   <?php endif; ?>
 
   <form method="post" action="?action=create_calendar">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
     <input type="hidden" name="principal_uri" value="<?= rdv_html($puri) ?>">
     <input type="hidden" name="principal_id" value="<?= (int) $principal['id'] ?>">
     <p>
@@ -1427,6 +2870,7 @@ elseif ($action === 'view_user'):
           <td>
             <!-- EDIT form for addressbook name + description -->
             <form class="inline" method="post" action="?action=update_addressbook">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
               <input type="hidden" name="addressbook_id" value="<?= (int) $ab['id'] ?>">
               <input type="hidden" name="principal_id" value="<?= (int) $principal['id'] ?>">
               <input type="text" name="displayname" value="<?= rdv_html((string) $ab['displayname']) ?>" size="16">
@@ -1439,6 +2883,7 @@ elseif ($action === 'view_user'):
             </form>
             <form class="inline" method="post" action="?action=delete_addressbook"
                   onsubmit="return confirm('Delete this addressbook (and all its contacts)?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
               <input type="hidden" name="addressbook_id" value="<?= (int) $ab['id'] ?>">
               <input type="hidden" name="principal_id" value="<?= (int) $principal['id'] ?>">
               <button class="btn small danger" type="submit">Delete</button>
@@ -1451,6 +2896,7 @@ elseif ($action === 'view_user'):
   <?php endif; ?>
 
   <form method="post" action="?action=create_addressbook">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
     <input type="hidden" name="principal_uri" value="<?= rdv_html($puri) ?>">
     <input type="hidden" name="principal_id" value="<?= (int) $principal['id'] ?>">
     <p>
@@ -1530,6 +2976,7 @@ elseif (in_array($action, ['sharing_bookmarks', 'bookmarks'], true)): ?>
   <h3 id="domain-form">Domain sharing rules</h3>
   <p class="muted">Leave domain blank to affect Roundcube users without an @domain.</p>
   <form method="post" action="?action=bookmark_domain_save">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
     <p>
       <label>Domain<br>
         <input type="text" name="domain" value="<?= rdv_html($editingDomainValue) ?>" placeholder="example.com">
@@ -1593,6 +3040,7 @@ elseif (in_array($action, ['sharing_bookmarks', 'bookmarks'], true)): ?>
           <td>
             <a class="btn small" href="?action=sharing_bookmarks&amp;domain=<?= rawurlencode((string) ($domainRow['domain'] ?? '')) ?>#domain-form">Edit</a>
             <form class="inline" method="post" action="?action=bookmark_domain_delete" onsubmit="return confirm('Delete overrides for this domain?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
               <input type="hidden" name="domain" value="<?= rdv_html($domainRow['domain'] ?? '') ?>">
               <button class="btn small danger" type="submit">Delete</button>
             </form>
@@ -1715,6 +3163,7 @@ elseif ($action === 'sharing_calendar'): ?>
     <div class="form-card stacked-form">
       <h3>Create share</h3>
       <form method="post" action="?action=create_global_collection">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
         <input type="hidden" name="type" value="calendar">
         <input type="hidden" name="redirect_action" value="sharing_calendar">
         <label>URI<br>
@@ -1793,6 +3242,7 @@ elseif ($action === 'sharing_calendar'): ?>
           <strong>Rules:</strong> <?= rdv_count_global_permissions($pdo, (int) $col['id']) ?>
         </p>
         <form class="stacked-form" method="post" action="?action=update_calendar_share">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
           <input type="hidden" name="collection_id" value="<?= (int) $col['id'] ?>">
           <label>Components<br>
             <select name="components">
@@ -1820,6 +3270,7 @@ elseif ($action === 'sharing_calendar'): ?>
           <p><button class="btn small" type="submit">Save settings</button></p>
         </form>
         <form class="inline" method="post" action="?action=delete_global_collection" onsubmit="return confirm('Delete this shared calendar?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
           <input type="hidden" name="collection_id" value="<?= (int) $col['id'] ?>">
           <input type="hidden" name="redirect_action" value="sharing_calendar">
           <button class="btn small danger" type="submit">Delete</button>
@@ -1850,6 +3301,7 @@ elseif ($action === 'sharing_calendar'): ?>
                 <td><?= !empty($perm['read_only']) ? 'read-only' : 'read/write' ?></td>
                 <td>
                   <form class="inline" method="post" action="?action=delete_global_permission" onsubmit="return confirm('Remove this permission?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
                     <input type="hidden" name="permission_id" value="<?= (int) $perm['id'] ?>">
                     <input type="hidden" name="redirect_action" value="sharing_calendar">
                     <button class="btn small danger" type="submit">Remove</button>
@@ -1862,6 +3314,7 @@ elseif ($action === 'sharing_calendar'): ?>
         <?php endif; ?>
 
         <form method="post" action="?action=add_global_permission">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
           <input type="hidden" name="collection_id" value="<?= (int) $col['id'] ?>">
           <input type="hidden" name="redirect_action" value="sharing_calendar">
           <p>
@@ -1913,6 +3366,7 @@ elseif ($action === 'sharing_addressbook'): ?>
     <div class="form-card stacked-form">
       <h3>Create share</h3>
       <form method="post" action="?action=create_global_collection">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
         <input type="hidden" name="type" value="addressbook">
         <input type="hidden" name="redirect_action" value="sharing_addressbook">
         <label>URI<br>
@@ -1974,6 +3428,7 @@ elseif ($action === 'sharing_addressbook'): ?>
           <strong>Rules:</strong> <?= rdv_count_global_permissions($pdo, (int) $col['id']) ?>
         </p>
         <form class="stacked-form" method="post" action="?action=update_addressbook_share">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
           <input type="hidden" name="collection_id" value="<?= (int) $col['id'] ?>">
           <label>Sync mode<br>
             <select name="sync_mode">
@@ -1995,6 +3450,7 @@ elseif ($action === 'sharing_addressbook'): ?>
           <p><button class="btn small" type="submit">Save settings</button></p>
         </form>
         <form class="inline" method="post" action="?action=delete_global_collection" onsubmit="return confirm('Delete this shared addressbook?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
           <input type="hidden" name="collection_id" value="<?= (int) $col['id'] ?>">
           <input type="hidden" name="redirect_action" value="sharing_addressbook">
           <button class="btn small danger" type="submit">Delete</button>
@@ -2025,6 +3481,7 @@ elseif ($action === 'sharing_addressbook'): ?>
                 <td><?= !empty($perm['read_only']) ? 'read-only' : 'read/write' ?></td>
                 <td>
                   <form class="inline" method="post" action="?action=delete_global_permission" onsubmit="return confirm('Remove this permission?');">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
                     <input type="hidden" name="permission_id" value="<?= (int) $perm['id'] ?>">
                     <input type="hidden" name="redirect_action" value="sharing_addressbook">
                     <button class="btn small danger" type="submit">Remove</button>
@@ -2037,6 +3494,7 @@ elseif ($action === 'sharing_addressbook'): ?>
         <?php endif; ?>
 
         <form method="post" action="?action=add_global_permission">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
           <input type="hidden" name="collection_id" value="<?= (int) $col['id'] ?>">
           <input type="hidden" name="redirect_action" value="sharing_addressbook">
           <p>
@@ -2081,6 +3539,7 @@ elseif ($action === 'sharing_files'): ?>
 
   <div class="share-config">
     <form class="stacked-form" method="post" action="?action=update_file_sharing">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
       <label>Default permission<br>
         <select name="default_access">
           <option value="read" <?= ($fileSettings['default_access'] ?? '') === 'read' ? 'selected' : '' ?>>Read only</option>
@@ -2126,7 +3585,47 @@ elseif ($action === 'sharing_files'): ?>
 // Config view
 elseif ($action === 'config'): ?>
 
-  <?php $configSaved = !empty($_GET['saved']); ?>
+  <?php
+    $configSaved = !empty($_GET['saved']);
+    $configImported = !empty($_GET['imported']);
+    $configRestored = trim((string) ($_GET['restored'] ?? ''));
+    $backupCreated = trim((string) ($_GET['backup_created'] ?? ''));
+    $backupPolicySaved = !empty($_GET['backup_policy_saved']);
+    $backupPruned = max(0, (int) ($_GET['backup_pruned'] ?? 0));
+    $backupPruneFailed = max(0, (int) ($_GET['backup_prune_failed'] ?? 0));
+    $importPreview = $_SESSION['rdv_config_import_preview'] ?? null;
+    if (!is_array($importPreview)) {
+        $importPreview = null;
+    }
+    $backupRetention = rdv_backup_retention_settings($config);
+    $backupItems = rdv_list_config_backups(RDV_CONFIG_FILE, 30);
+    $backupSummary = [
+        'count' => 0,
+        'total_size' => 0,
+        'newest_mtime' => 0,
+        'oldest_mtime' => 0,
+    ];
+    if ($backupItems) {
+        $backupSummary['count'] = count($backupItems);
+        $mtimes = [];
+        foreach ($backupItems as $item) {
+            $size = (int) ($item['size'] ?? 0);
+            $mtime = (int) ($item['mtime'] ?? 0);
+            if ($size > 0) {
+                $backupSummary['total_size'] += $size;
+            }
+            if ($mtime > 0) {
+                $mtimes[] = $mtime;
+            }
+        }
+        if ($mtimes) {
+            $backupSummary['newest_mtime'] = max($mtimes);
+            $backupSummary['oldest_mtime'] = min($mtimes);
+        }
+    }
+    $headerDiag = rdv_security_headers_diagnostics($config);
+    $expectedHeaders = rdv_expected_security_headers($config);
+  ?>
   <hr>
 <h2>Server configuration</h2>
 <p class="muted">
@@ -2135,11 +3634,189 @@ elseif ($action === 'config'): ?>
 </p>
 <?php if ($configSaved): ?>
   <div class="alert success">Configuration saved.</div>
+  <?php if ($configImported): ?>
+    <div class="alert success">Config snapshot imported and applied.</div>
+  <?php endif; ?>
+  <?php if ($configRestored !== ''): ?>
+    <div class="alert success">Config restored from backup: <code><?= rdv_html($configRestored) ?></code></div>
+  <?php endif; ?>
 <?php elseif (!empty($error)): ?>
   <div class="alert error"><?= rdv_html($error) ?></div>
 <?php endif; ?>
+<?php if ($backupCreated !== ''): ?>
+  <div class="alert success">Backup created: <code><?= rdv_html($backupCreated) ?></code></div>
+<?php endif; ?>
+<?php if ($backupPolicySaved): ?>
+  <div class="alert success">Backup retention policy saved.</div>
+<?php endif; ?>
+<?php if (isset($_GET['backup_pruned'])): ?>
+  <div class="alert success">Backup prune complete. Removed <?= $backupPruned ?> backup(s)<?= $backupPruneFailed > 0 ? '; failed to remove ' . $backupPruneFailed . '.' : '.' ?></div>
+<?php endif; ?>
+
+<script>
+(function() {
+  function initSecurityHeaderTools() {
+    var crossBtn = document.getElementById('apply-cross-origin-profile');
+    var sameBtn = document.getElementById('apply-same-origin-profile');
+    var verifyBtn = document.getElementById('verify-security-headers');
+    var statusEl = document.getElementById('security-profile-status');
+    var verifyResultsEl = document.getElementById('security-headers-verify-results');
+
+    if (!crossBtn || !sameBtn || !verifyBtn) {
+      return;
+    }
+
+  var profiles = {
+    cross: <?= json_encode($headerDiag['profile_cross_origin_fields'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>,
+    same: <?= json_encode($headerDiag['profile_same_origin_fields'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>
+  };
+  var expectedHeaders = <?= json_encode($expectedHeaders, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>;
+  var relevantHeaders = [
+    'x-content-type-options',
+    'referrer-policy',
+    'permissions-policy',
+    'x-frame-options',
+    'content-security-policy'
+  ];
+  var targets = [
+    { label: 'Admin UI', url: '?action=config' },
+    { label: 'Files UI', url: '../files/index.php?action=login' }
+  ];
+
+  function setStatus(text) {
+    if (!statusEl) {
+      return;
+    }
+    statusEl.style.display = '';
+    statusEl.textContent = text;
+  }
+
+  function esc(str) {
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function applyProfile(profile, label) {
+    Object.keys(profile).forEach(function(name) {
+      var el = document.querySelector('[name="' + name + '"]');
+      if (!el) {
+        return;
+      }
+
+      if (el.type === 'checkbox') {
+        el.checked = !!profile[name];
+      } else {
+        el.value = profile[name];
+      }
+    });
+
+    setStatus(label + ' applied. Review values and click "Save configuration" to persist.');
+  }
+
+  crossBtn.addEventListener('click', function() {
+    applyProfile(profiles.cross, 'Cross-origin embed profile');
+  });
+
+  sameBtn.addEventListener('click', function() {
+    applyProfile(profiles.same, 'Same-origin locked profile');
+  });
+
+  async function verifyOne(target) {
+    var res = await fetch(target.url, {
+      method: 'GET',
+      credentials: 'same-origin',
+      cache: 'no-store'
+    });
+
+    var actual = {};
+    relevantHeaders.forEach(function(name) {
+      var value = res.headers.get(name);
+      actual[name] = value === null ? '' : value;
+    });
+
+    return {
+      label: target.label,
+      url: target.url,
+      status: res.status,
+      actual: actual
+    };
+  }
+
+  function renderVerification(results, errorText) {
+    if (!verifyResultsEl) {
+      return;
+    }
+
+    verifyResultsEl.style.display = '';
+
+    if (errorText) {
+      verifyResultsEl.className = 'alert error';
+      verifyResultsEl.textContent = errorText;
+      return;
+    }
+
+    var html = '';
+    results.forEach(function(result) {
+      html += '<h4>' + esc(result.label) + ' <span class="pill">HTTP ' + esc(result.status) + '</span></h4>';
+      html += '<table><thead><tr><th>Header</th><th>Expected</th><th>Actual</th><th>Status</th></tr></thead><tbody>';
+
+      relevantHeaders.forEach(function(name) {
+        var expected = expectedHeaders[name] || '';
+        var actual = result.actual[name] || '';
+        var status = 'OK';
+        if (expected === '' && actual !== '') {
+          status = 'Extra';
+        } else if (expected !== '' && actual === '') {
+          status = 'Missing';
+        } else if (expected !== '' && actual !== expected) {
+          status = 'Mismatch';
+        }
+
+        html += '<tr>'
+          + '<td><code>' + esc(name) + '</code></td>'
+          + '<td>' + (expected === '' ? '<span class="muted">(not set)</span>' : '<code>' + esc(expected) + '</code>') + '</td>'
+          + '<td>' + (actual === '' ? '<span class="muted">(not set)</span>' : '<code>' + esc(actual) + '</code>') + '</td>'
+          + '<td>' + esc(status) + '</td>'
+          + '</tr>';
+      });
+
+      html += '</tbody></table>';
+    });
+
+    verifyResultsEl.className = 'share-config';
+    verifyResultsEl.innerHTML = html;
+  }
+
+    verifyBtn.addEventListener('click', async function() {
+      if (verifyResultsEl) {
+        verifyResultsEl.style.display = '';
+        verifyResultsEl.className = 'muted';
+        verifyResultsEl.textContent = 'Verifying current response headers...';
+      }
+
+      try {
+        var results = await Promise.all(targets.map(verifyOne));
+        renderVerification(results, '');
+      } catch (err) {
+        renderVerification([], 'Header verification failed: ' + (err && err.message ? err.message : String(err)));
+      }
+    });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initSecurityHeaderTools);
+  } else {
+    initSecurityHeaderTools();
+  }
+})();
+</script>
 
 <form method="post" action="?action=update_config">
+  <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
   <div class="settings-grid">
     <div class="form-card stacked-form">
       <h3>General</h3>
@@ -2180,6 +3857,12 @@ elseif ($action === 'config'): ?>
       <label>Default quota (MB)<br>
         <input type="number" min="0" name="files_default_quota" value="<?= (int) ($config['files']['default_quota_mb'] ?? 0) ?>">
       </label>
+      <label>Shared files write policy<br>
+        <select name="files_shared_write_policy">
+          <option value="admins_only" <?= (($config['files']['shared_write_policy'] ?? 'admins_only') === 'admins_only') ? 'selected' : '' ?>>Admins only</option>
+          <option value="authenticated_users" <?= (($config['files']['shared_write_policy'] ?? '') === 'authenticated_users') ? 'selected' : '' ?>>All authenticated users</option>
+        </select>
+      </label>
     </div>
     <div class="form-card stacked-form">
       <h3>Security / Rate limiting</h3>
@@ -2196,6 +3879,47 @@ elseif ($action === 'config'): ?>
       <label>Block duration (minutes)<br>
         <input type="number" min="1" name="rate_limit_block" value="<?= (int) ($config['security']['rate_limit']['block_minutes'] ?? 30) ?>">
       </label>
+      <label>
+        <input type="checkbox" name="trust_proxy_headers" value="1" <?= !empty($config['security']['trust_proxy_headers']) ? 'checked' : '' ?>>
+        Trust <code>X-Forwarded-Host</code> for origin checks (reverse proxy mode)
+      </label>
+    </div>
+    <div class="form-card stacked-form">
+      <h3>Security Headers</h3>
+      <label>
+        <input type="checkbox" name="headers_enabled" value="1" <?= !array_key_exists('enabled', (array) ($config['security']['headers'] ?? [])) || !empty($config['security']['headers']['enabled']) ? 'checked' : '' ?>>
+        Enable response security headers on Admin/Files pages
+      </label>
+      <label>
+        <input type="checkbox" name="headers_nosniff" value="1" <?= !array_key_exists('x_content_type_options', (array) ($config['security']['headers'] ?? [])) || !empty($config['security']['headers']['x_content_type_options']) ? 'checked' : '' ?>>
+        Send <code>X-Content-Type-Options: nosniff</code>
+      </label>
+      <label>Referrer-Policy<br>
+        <input type="text" name="headers_referrer_policy" value="<?= rdv_html((string) ($config['security']['headers']['referrer_policy'] ?? 'strict-origin-when-cross-origin')) ?>">
+      </label>
+      <label>Permissions-Policy<br>
+        <input type="text" name="headers_permissions_policy" value="<?= rdv_html((string) ($config['security']['headers']['permissions_policy'] ?? 'camera=(), microphone=(), geolocation=(), payment=(), usb=()')) ?>">
+      </label>
+      <label>X-Frame-Options<br>
+        <?php $xfoValue = strtoupper((string) ($config['security']['headers']['x_frame_options'] ?? '')); ?>
+        <select name="headers_x_frame_options">
+          <option value="" <?= $xfoValue === '' ? 'selected' : '' ?>>Disabled (allow embedding)</option>
+          <option value="SAMEORIGIN" <?= $xfoValue === 'SAMEORIGIN' ? 'selected' : '' ?>>SAMEORIGIN</option>
+          <option value="DENY" <?= $xfoValue === 'DENY' ? 'selected' : '' ?>>DENY</option>
+        </select>
+      </label>
+      <label>
+        <input type="checkbox" name="headers_csp_enabled" value="1" <?= !empty($config['security']['headers']['csp']['enabled']) ? 'checked' : '' ?>>
+        Enable Content-Security-Policy
+      </label>
+      <label>CSP policy override (optional)<br>
+        <textarea name="headers_csp_policy" rows="4" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;"><?= rdv_html((string) ($config['security']['headers']['csp']['policy'] ?? '')) ?></textarea>
+        <span class="hint">Leave blank to auto-generate a basic policy using frame-ancestors below.</span>
+      </label>
+      <label>CSP frame-ancestors (one per line or comma-separated)<br>
+        <textarea name="headers_csp_frame_ancestors" rows="3" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;"><?= rdv_html(is_array($config['security']['headers']['csp']['frame_ancestors'] ?? null) ? implode("\n", $config['security']['headers']['csp']['frame_ancestors']) : "'self'") ?></textarea>
+        <span class="hint">For cross-origin Roundcube embedding, keep X-Frame-Options disabled and include your Roundcube origin (e.g. <code>https://mail.example.com</code>).</span>
+      </label>
     </div>
     <div class="form-card stacked-form">
       <h3>Provisioning</h3>
@@ -2204,6 +3928,14 @@ elseif ($action === 'config'): ?>
       </label>
       <label>Principal prefix<br>
         <input type="text" name="provision_principal_prefix" value="<?= rdv_html((string) ($config['provision']['principal_prefix'] ?? 'principals')) ?>">
+      </label>
+      <label>Provision API shared secret<br>
+        <input type="text" name="provision_shared_secret" value="<?= rdv_html((string) ($config['provision']['shared_secret'] ?? '')) ?>">
+        <span class="hint">Must match <code>rounddav_api_token</code> in the Roundcube provision plugin.</span>
+      </label>
+      <label>
+        <input type="checkbox" name="generate_provision_secret" value="1">
+        Generate a new provisioning secret on save
       </label>
     </div>
     <div class="form-card stacked-form">
@@ -2219,6 +3951,28 @@ elseif ($action === 'config'): ?>
       <label>Session TTL (seconds)<br>
         <input type="number" min="60" name="sso_ttl" value="<?= (int) ($config['sso']['ttl'] ?? 600) ?>">
       </label>
+      <label>
+        <input type="checkbox" name="generate_sso_secret" value="1">
+        Generate a new SSO secret on save
+      </label>
+    </div>
+    <div class="form-card stacked-form">
+      <h3>Bookmarks API</h3>
+      <label>Bookmark shared secret<br>
+        <input type="text" name="bookmarks_shared_secret" value="<?= rdv_html((string) ($config['bookmarks']['shared_secret'] ?? '')) ?>">
+        <span class="hint">Leave empty to disable dedicated bookmark token and fall back to provisioning token.</span>
+      </label>
+      <label>
+        <input type="checkbox" name="generate_bookmark_secret" value="1">
+        Generate a new bookmark API secret on save
+      </label>
+    </div>
+    <div class="form-card stacked-form">
+      <h3>Endpoints</h3>
+      <label>
+        <input type="checkbox" name="endpoint_enable_testdav" value="1" <?= !empty($config['endpoints']['enable_testdav']) ? 'checked' : '' ?>>
+        Enable diagnostic endpoint <code>public/testdav.php</code>
+      </label>
     </div>
     <div class="form-card stacked-form">
       <h3>Admin</h3>
@@ -2233,9 +3987,218 @@ elseif ($action === 'config'): ?>
       </label>
     </div>
   </div>
+
+<hr>
+<div class="share-config">
+  <h3>Config Snapshot</h3>
+  <p class="muted">
+    Export a JSON snapshot of the current configuration, then preview and apply imports with a diff.
+    A timestamped backup of <code>config.php</code> is created automatically before writes/imports.
+  </p>
+
+  <div class="settings-grid">
+    <div class="form-card stacked-form">
+      <h4>Export</h4>
+      <form method="post" action="?action=export_config_snapshot">
+        <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+        <label>
+          <input type="checkbox" name="include_secrets" value="1">
+          Include secrets in snapshot export
+        </label>
+        <p><button class="btn small" type="submit">Download snapshot</button></p>
+      </form>
+      <hr>
+      <form method="post" action="?action=create_config_backup">
+        <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+        <p><button class="btn small" type="submit">Create backup now</button></p>
+      </form>
+      <hr>
+      <h4>Retention</h4>
+      <form method="post" action="?action=update_backup_retention">
+        <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+        <label>Keep newest backups<br>
+          <input type="number" min="1" max="1000" name="backup_keep_last" value="<?= (int) ($backupRetention['keep_last'] ?? 30) ?>">
+        </label>
+        <label>Delete backups older than days (0 = disable)<br>
+          <input type="number" min="0" max="3650" name="backup_max_age_days" value="<?= (int) ($backupRetention['max_age_days'] ?? 0) ?>">
+        </label>
+        <label>
+          <input type="checkbox" name="backup_auto_prune" value="1" <?= !empty($backupRetention['auto_prune']) ? 'checked' : '' ?>>
+          Auto-prune after config writes/restores/backups
+        </label>
+        <p><button class="btn small" type="submit">Save retention</button></p>
+      </form>
+      <form method="post" action="?action=prune_config_backups" onsubmit="return confirm('Prune old config backups now using current retention policy?');">
+        <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+        <p><button class="btn small danger" type="submit">Prune now</button></p>
+      </form>
+    </div>
+    <div class="form-card stacked-form">
+      <h4>Import</h4>
+      <form method="post" action="?action=preview_config_snapshot">
+        <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+        <label>Snapshot JSON<br>
+          <textarea name="snapshot_json" rows="8" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;" placeholder='Paste full snapshot JSON here'></textarea>
+        </label>
+        <span class="hint">If the snapshot contains <code>***redacted***</code> secret placeholders, current live secret values are preserved during import.</span>
+        <p><button class="btn small" type="submit">Preview import diff</button></p>
+      </form>
+    </div>
+  </div>
+
+  <div class="share-config">
+    <h4>Backup summary</h4>
+    <p class="muted">
+      <strong>Count:</strong> <?= (int) $backupSummary['count'] ?> ·
+      <strong>Total size:</strong> <?= number_format((int) $backupSummary['total_size']) ?> bytes ·
+      <strong>Newest:</strong> <?= !empty($backupSummary['newest_mtime']) ? date('Y-m-d H:i:s', (int) $backupSummary['newest_mtime']) : '-' ?> ·
+      <strong>Oldest:</strong> <?= !empty($backupSummary['oldest_mtime']) ? date('Y-m-d H:i:s', (int) $backupSummary['oldest_mtime']) : '-' ?>
+    </p>
+  </div>
+
+  <h4>Available backups</h4>
+  <?php if (!$backupItems): ?>
+    <p class="muted">No config backups found yet.</p>
+  <?php else: ?>
+    <form method="post" action="?action=download_all_config_backups" style="margin: 0 0 10px 0;">
+      <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+      <button class="btn small" type="submit">Download all as ZIP</button>
+    </form>
+    <table>
+      <thead>
+        <tr>
+          <th>Filename</th>
+          <th>Modified</th>
+          <th>Size</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      <?php foreach ($backupItems as $item): ?>
+        <tr>
+          <td><code><?= rdv_html((string) $item['name']) ?></code></td>
+          <td><?= !empty($item['mtime']) ? date('Y-m-d H:i:s', (int) $item['mtime']) : '-' ?></td>
+          <td><?= number_format((int) $item['size']) ?> bytes</td>
+          <td>
+            <form class="inline" method="post" action="?action=download_config_backup" style="display:inline;">
+              <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+              <input type="hidden" name="backup_name" value="<?= rdv_html((string) $item['name']) ?>">
+              <button class="btn small" type="submit">Download</button>
+            </form>
+            <form class="inline" method="post" action="?action=restore_config_backup" style="display:inline;" onsubmit="return confirm('Restore this backup and replace current config.php?');">
+              <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+              <input type="hidden" name="backup_name" value="<?= rdv_html((string) $item['name']) ?>">
+              <button class="btn small danger" type="submit">Restore</button>
+            </form>
+          </td>
+        </tr>
+      <?php endforeach; ?>
+      </tbody>
+    </table>
+  <?php endif; ?>
+</div>
+
+<?php if ($importPreview): ?>
+  <?php
+    $importDiff = is_array($importPreview['diff'] ?? null) ? $importPreview['diff'] : ['rows' => [], 'total' => 0, 'truncated' => false];
+    $importRows = is_array($importDiff['rows'] ?? null) ? $importDiff['rows'] : [];
+    $importTotal = (int) ($importDiff['total'] ?? 0);
+    $importTruncated = !empty($importDiff['truncated']);
+  ?>
+  <div class="share-config">
+    <h3>Import Preview</h3>
+    <p class="muted">
+      Detected <strong><?= $importTotal ?></strong> change(s) versus current config.
+      <?php if ($importTruncated): ?>
+        Showing first <?= count($importRows) ?> entries.
+      <?php endif; ?>
+    </p>
+    <p>
+      <form class="inline" method="post" action="?action=apply_config_snapshot" style="display:inline;">
+        <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+        <button class="btn small" type="submit">Apply import</button>
+      </form>
+      <form class="inline" method="post" action="?action=cancel_config_snapshot" style="display:inline;">
+        <input type="hidden" name="_rdv_csrf" value="<?= rdv_html(rdv_csrf_token()) ?>">
+        <button class="btn small danger" type="submit">Cancel preview</button>
+      </form>
+    </p>
+    <?php if (!$importRows): ?>
+      <p class="muted">No differences found.</p>
+    <?php else: ?>
+      <table>
+        <thead>
+          <tr>
+            <th>Path</th>
+            <th>Status</th>
+            <th>Current</th>
+            <th>Incoming</th>
+          </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($importRows as $row): ?>
+          <tr>
+            <td><code><?= rdv_html((string) ($row['path'] ?? '')) ?></code></td>
+            <td><?= rdv_html((string) ($row['status'] ?? 'changed')) ?></td>
+            <td><code><?= rdv_html((string) ($row['current'] ?? '')) ?></code></td>
+            <td><code><?= rdv_html((string) ($row['incoming'] ?? '')) ?></code></td>
+          </tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php endif; ?>
+  </div>
+<?php endif; ?>
+
+<div class="share-config">
+  <h3>Security diagnostics</h3>
+  <p class="muted">
+    Effective state:
+    <strong>headers</strong>=<?= $headerDiag['enabled'] ? 'on' : 'off' ?> ·
+    <strong>nosniff</strong>=<?= $headerDiag['nosniff'] ? 'on' : 'off' ?> ·
+    <strong>X-Frame-Options</strong>=<?= rdv_html((string) $headerDiag['x_frame_options']) ?> ·
+    <strong>CSP</strong>=<?= $headerDiag['csp_enabled'] ? 'on' : 'off' ?> ·
+    <strong>CSP override</strong>=<?= rdv_html((string) $headerDiag['csp_policy_override']) ?>
+  </p>
+  <p class="muted">
+    <strong>Referrer-Policy:</strong> <code><?= rdv_html((string) $headerDiag['referrer_policy']) ?></code><br>
+    <strong>Permissions-Policy:</strong> <code><?= rdv_html((string) $headerDiag['permissions_policy']) ?></code><br>
+    <strong>frame-ancestors:</strong> <code><?= rdv_html((string) $headerDiag['frame_ancestors']) ?></code>
+  </p>
+
+  <?php if (!empty($headerDiag['warnings'])): ?>
+    <div class="alert error">
+      <?php foreach ($headerDiag['warnings'] as $warning): ?>
+        <div><?= rdv_html((string) $warning) ?></div>
+      <?php endforeach; ?>
+    </div>
+  <?php else: ?>
+    <div class="alert success">No obvious security-header conflicts detected.</div>
+  <?php endif; ?>
+
+  <p><strong>Recommended profiles</strong></p>
+  <p>
+    <button class="btn small" type="button" id="apply-cross-origin-profile">Apply Cross-origin Embed Profile</button>
+    <button class="btn small" type="button" id="apply-same-origin-profile">Apply Same-origin Locked Profile</button>
+    <button class="btn small" type="button" id="verify-security-headers">Verify Current Headers</button>
+  </p>
+  <p id="security-profile-status" class="muted" style="display:none;"></p>
+  <div id="security-headers-verify-results" class="muted" style="display:none;"></div>
+  <div class="settings-grid">
+    <div class="form-card stacked-form">
+      <h4>Cross-origin Roundcube Embed</h4>
+      <pre style="white-space:pre-wrap;line-height:1.5;background:#020617;border-radius:10px;padding:12px;"><?= rdv_html((string) $headerDiag['profile_cross_origin']) ?></pre>
+    </div>
+    <div class="form-card stacked-form">
+      <h4>Same-origin Locked Down</h4>
+      <pre style="white-space:pre-wrap;line-height:1.5;background:#020617;border-radius:10px;padding:12px;"><?= rdv_html((string) $headerDiag['profile_same_origin']) ?></pre>
+    </div>
+  </div>
+</div>
+
   <p><button class="btn" type="submit">Save configuration</button></p>
 </form>
-<p class="muted">Config file: <code><?= rdv_html(RDV_CONFIG_FILE) ?></code>. Password hashes are stored securely; plaintext passwords are never echoed.</p>
+<p class="muted">Config file: <code><?= rdv_html(RDV_CONFIG_FILE) ?></code>. Rotating provision/SSO secrets requires updating Roundcube plugin settings.</p>
 
 <?php
 endif;

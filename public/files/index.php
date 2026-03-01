@@ -24,6 +24,87 @@ if (!file_exists($configFile)) {
 }
 $config = require $configFile;
 
+function rdv_send_security_headers(array $config): void
+{
+    $headersCfg = (array) ($config['security']['headers'] ?? []);
+    if (array_key_exists('enabled', $headersCfg) && empty($headersCfg['enabled'])) {
+        return;
+    }
+
+    $sendNosniff = !array_key_exists('x_content_type_options', $headersCfg)
+        || !empty($headersCfg['x_content_type_options']);
+    if ($sendNosniff) {
+        header('X-Content-Type-Options: nosniff');
+    }
+
+    $referrerPolicy = trim((string) ($headersCfg['referrer_policy'] ?? 'strict-origin-when-cross-origin'));
+    if ($referrerPolicy !== '') {
+        header('Referrer-Policy: ' . $referrerPolicy);
+    }
+
+    $permissionsPolicy = trim((string) ($headersCfg['permissions_policy'] ?? 'camera=(), microphone=(), geolocation=(), payment=(), usb=()'));
+    if ($permissionsPolicy !== '') {
+        header('Permissions-Policy: ' . $permissionsPolicy);
+    }
+
+    $xfo = trim((string) ($headersCfg['x_frame_options'] ?? ''));
+    if ($xfo !== '') {
+        header('X-Frame-Options: ' . $xfo);
+    }
+
+    $cspCfg = (array) ($headersCfg['csp'] ?? []);
+    if (empty($cspCfg['enabled'])) {
+        return;
+    }
+
+    $policy = trim((string) ($cspCfg['policy'] ?? ''));
+    if ($policy === '') {
+        $ancestors = $cspCfg['frame_ancestors'] ?? ["'self'"];
+        if (is_string($ancestors)) {
+            $ancestors = preg_split('/[\s,;]+/', $ancestors) ?: [];
+        }
+        if (!is_array($ancestors) || !$ancestors) {
+            $ancestors = ["'self'"];
+        }
+
+        $tokens = [];
+        foreach ($ancestors as $item) {
+            $token = trim((string) $item);
+            if ($token === '') {
+                continue;
+            }
+            if (strtolower($token) === 'self') {
+                $token = "'self'";
+            }
+            $tokens[] = $token;
+        }
+        if (!$tokens) {
+            $tokens = ["'self'"];
+        }
+
+        $policy = "default-src 'self'; "
+            . "img-src 'self' data: blob:; "
+            . "style-src 'self' 'unsafe-inline'; "
+            . "script-src 'self' 'unsafe-inline'; "
+            . "frame-ancestors " . implode(' ', $tokens);
+    }
+
+    header('Content-Security-Policy: ' . $policy);
+}
+
+rdv_send_security_headers($config);
+
+$rate = \RoundDAV\Security\RateLimitGuard::checkAndConsume($config, 'files');
+foreach (\RoundDAV\Security\RateLimitGuard::headerMap($rate) as $name => $value) {
+    header($name . ': ' . $value);
+}
+if (empty($rate['allowed'])) {
+    http_response_code(429);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Too Many Requests\n";
+    exit;
+}
+
 $db = $config['database'] ?? [];
 try {
     $pdo = new \PDO(
@@ -84,6 +165,43 @@ function rdv_sanitize_relpath(string $path): string
     return implode('/', $parts);
 }
 
+function rdv_sanitize_filename(string $file): string
+{
+    $file = str_replace(["\0", '/', '\\'], '', (string) $file);
+    return trim($file);
+}
+
+function rdv_resolve_existing_path(string $base, string $rel, string $file): ?string
+{
+    $rel  = rdv_sanitize_relpath($rel);
+    $file = rdv_sanitize_filename($file);
+
+    if ($file === '') {
+        return null;
+    }
+
+    $baseReal = realpath($base);
+    if ($baseReal === false || !is_dir($baseReal)) {
+        return null;
+    }
+
+    $candidate = $baseReal . DIRECTORY_SEPARATOR
+        . ($rel === '' ? '' : $rel . DIRECTORY_SEPARATOR)
+        . $file;
+
+    $pathReal = realpath($candidate);
+    if ($pathReal === false || !is_file($pathReal)) {
+        return null;
+    }
+
+    $basePrefix = rtrim($baseReal, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+    if (strncmp($pathReal, $basePrefix, strlen($basePrefix)) !== 0) {
+        return null;
+    }
+
+    return $pathReal;
+}
+
 /**
  * Ensure a directory exists (mkdir -p behavior).
  */
@@ -92,6 +210,138 @@ function rdv_ensure_dir(string $dir): void
     if (!is_dir($dir)) {
         @mkdir($dir, 0770, true);
     }
+}
+
+function rdv_normalize_host(string $host): string
+{
+    $host = trim($host);
+    if ($host === '') {
+        return '';
+    }
+
+    if ($host[0] === '[') {
+        $end = strpos($host, ']');
+        if ($end !== false) {
+            return strtolower(substr($host, 1, $end - 1));
+        }
+    }
+
+    return strtolower(trim(explode(':', $host)[0]));
+}
+
+function rdv_proxy_headers_trusted(): bool
+{
+    $security = $GLOBALS['config']['security'] ?? [];
+    return !empty($security['trust_proxy_headers']);
+}
+
+function rdv_request_hosts(): array
+{
+    $hosts = [];
+
+    $host = rdv_normalize_host((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    if ($host !== '') {
+        $hosts[] = $host;
+    }
+
+    if (rdv_proxy_headers_trusted()) {
+        $xfHost = trim((string) ($_SERVER['HTTP_X_FORWARDED_HOST'] ?? ''));
+        if ($xfHost !== '') {
+            foreach (explode(',', $xfHost) as $item) {
+                $candidate = rdv_normalize_host($item);
+                if ($candidate !== '') {
+                    $hosts[] = $candidate;
+                }
+            }
+        }
+    }
+
+    return array_values(array_unique($hosts));
+}
+
+function rdv_host_matches_url(string $url, array $hosts): bool
+{
+    $parts = @parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) {
+        return false;
+    }
+
+    $urlHost = strtolower((string) $parts['host']);
+    if ($urlHost === '' || !$hosts) {
+        return false;
+    }
+
+    return in_array($urlHost, $hosts, true);
+}
+
+function rdv_request_is_same_origin(): bool
+{
+    $hosts = rdv_request_hosts();
+    if (!$hosts) {
+        return true;
+    }
+
+    $origin = trim((string) ($_SERVER['HTTP_ORIGIN'] ?? ''));
+    if ($origin !== '') {
+        return rdv_host_matches_url($origin, $hosts);
+    }
+
+    $referer = trim((string) ($_SERVER['HTTP_REFERER'] ?? ''));
+    if ($referer !== '') {
+        return rdv_host_matches_url($referer, $hosts);
+    }
+
+    $secFetchSite = strtolower(trim((string) ($_SERVER['HTTP_SEC_FETCH_SITE'] ?? '')));
+    if ($secFetchSite === 'cross-site') {
+        return false;
+    }
+
+    return true;
+}
+
+function rdv_require_safe_post_request(): void
+{
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        return;
+    }
+
+    if (!rdv_request_is_same_origin()) {
+        http_response_code(403);
+        echo 'Cross-site POST denied';
+        exit;
+    }
+
+    $token = (string) ($_POST['_rdv_csrf'] ?? '');
+    if (!rdv_csrf_token_is_valid($token)) {
+        http_response_code(403);
+        echo 'Invalid CSRF token';
+        exit;
+    }
+}
+
+function rdv_csrf_token(): string
+{
+    $token = $_SESSION['rounddav_files_csrf'] ?? '';
+    if (!is_string($token) || $token === '') {
+        try {
+            $token = bin2hex(random_bytes(32));
+        } catch (Throwable $e) {
+            $token = hash('sha256', uniqid('rdv_files_csrf', true) . microtime(true));
+        }
+        $_SESSION['rounddav_files_csrf'] = $token;
+    }
+
+    return $token;
+}
+
+function rdv_csrf_token_is_valid(string $token): bool
+{
+    if ($token === '') {
+        return false;
+    }
+
+    $expected = $_SESSION['rounddav_files_csrf'] ?? '';
+    return is_string($expected) && $expected !== '' && hash_equals($expected, $token);
 }
 
 /**
@@ -112,11 +362,20 @@ function rdv_preview_type(string $name): string
     if (in_array($ext, ['pdf'], true)) {
         return 'pdf';
     }
-    if (in_array($ext, ['txt','log','md','markdown','csv','json','xml','ini','conf'], true)) {
+    if (in_array($ext, ['txt','log','csv','tsv','json','xml','ini','conf'], true)) {
         return 'text';
     }
     if (in_array($ext, ['html','htm'], true)) {
         return 'html';
+    }
+    if (in_array($ext, ['md','markdown'], true)) {
+        return 'markdown';
+    }
+    if (in_array($ext, ['doc','docx','odt','odf'], true)) {
+        return 'doc';
+    }
+    if (in_array($ext, ['xls','xlsx','ods'], true)) {
+        return 'sheet';
     }
     return 'other';
 }
@@ -126,12 +385,391 @@ function rdv_can_preview(string $name): bool
     return rdv_preview_type($name) !== 'other';
 }
 
+function rdv_preview_page(string $title, string $bodyHtml): void
+{
+    header('Content-Type: text/html; charset=utf-8');
+    header('X-Content-Type-Options: nosniff');
+    ?>
+    <!doctype html>
+    <html>
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title><?= htmlspecialchars($title, ENT_QUOTES) ?></title>
+        <style>
+            :root {
+                --rdv-bg: #eaeaea;
+                --rdv-card: #d6d6d6;
+                --rdv-border: #5c5c5c;
+                --rdv-text: #141414;
+                --rdv-muted: #4b5563;
+                --rdv-code: #111827;
+            }
+            body {
+                margin: 0;
+                padding: 18px;
+                background: var(--rdv-bg);
+                color: var(--rdv-text);
+                font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            }
+            .rdv-doc {
+                max-width: 920px;
+                margin: 0 auto;
+                background: var(--rdv-card);
+                border: 1px solid var(--rdv-border);
+                border-radius: 8px;
+                padding: 18px 20px;
+                box-shadow: 0 18px 40px rgba(0,0,0,0.15);
+            }
+            .rdv-doc h1,
+            .rdv-doc h2,
+            .rdv-doc h3,
+            .rdv-doc h4,
+            .rdv-doc h5,
+            .rdv-doc h6 {
+                margin: 1.1em 0 0.5em;
+            }
+            .rdv-doc p {
+                line-height: 1.55;
+                margin: 0 0 0.9em;
+            }
+            .rdv-doc pre {
+                background: #cfcfcf;
+                padding: 12px 14px;
+                border-radius: 6px;
+                overflow: auto;
+                color: var(--rdv-code);
+                font-size: 13px;
+            }
+            .rdv-doc code {
+                background: rgba(0,0,0,0.08);
+                padding: 1px 4px;
+                border-radius: 4px;
+            }
+            .rdv-doc table {
+                border-collapse: collapse;
+                width: 100%;
+                margin: 8px 0 16px;
+                font-size: 13px;
+            }
+            .rdv-doc th,
+            .rdv-doc td {
+                border: 1px solid var(--rdv-border);
+                padding: 6px 8px;
+                text-align: left;
+                vertical-align: top;
+            }
+            .rdv-doc th {
+                background: #bfbfbf;
+            }
+            .rdv-muted {
+                color: var(--rdv-muted);
+                font-size: 13px;
+            }
+            .rdv-doc blockquote {
+                margin: 0 0 1em;
+                padding: 8px 12px;
+                border-left: 3px solid #6b7280;
+                background: rgba(255,255,255,0.4);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="rdv-doc">
+            <?= $bodyHtml ?>
+        </div>
+    </body>
+    </html>
+    <?php
+}
+
+function rdv_sanitize_html(string $html, bool $allowStyle = false): string
+{
+    if ($html === '') {
+        return '';
+    }
+    libxml_use_internal_errors(true);
+    $doc = new DOMDocument();
+    $doc->loadHTML('<?xml encoding="utf-8"?>' . $html, LIBXML_HTML_NOIMPLIED | LIBXML_HTML_NODEFDTD);
+    libxml_clear_errors();
+
+    $blocked = ['script','iframe','object','embed','link','meta'];
+    if (!$allowStyle) {
+        $blocked[] = 'style';
+    }
+    foreach ($blocked as $tag) {
+        $nodes = $doc->getElementsByTagName($tag);
+        for ($i = $nodes->length - 1; $i >= 0; $i--) {
+            $node = $nodes->item($i);
+            if ($node && $node->parentNode) {
+                $node->parentNode->removeChild($node);
+            }
+        }
+    }
+
+    $xpath = new DOMXPath($doc);
+    $attrs = $xpath->query('//@*');
+    if ($attrs) {
+        foreach ($attrs as $attr) {
+            $name = strtolower($attr->nodeName);
+            $value = trim($attr->nodeValue);
+            if (strpos($name, 'on') === 0 || (!$allowStyle && $name === 'style')) {
+                $attr->ownerElement->removeAttributeNode($attr);
+                continue;
+            }
+            if (in_array($name, ['href','src'], true) && preg_match('/^\s*javascript:/i', $value)) {
+                $attr->ownerElement->removeAttributeNode($attr);
+            }
+        }
+    }
+
+    return $doc->saveHTML();
+}
+
+function rdv_markdown_inline(string $text): string
+{
+    $text = htmlspecialchars($text, ENT_QUOTES);
+    $text = preg_replace('/`([^`]+)`/', '<code>$1</code>', $text);
+    $text = preg_replace('/\*\*([^\*]+)\*\*/', '<strong>$1</strong>', $text);
+    $text = preg_replace('/\*([^\*]+)\*/', '<em>$1</em>', $text);
+    $text = preg_replace('/\[([^\]]+)\]\(([^)]+)\)/', '<a href="$2" target="_blank" rel="noopener">$1</a>', $text);
+    return $text;
+}
+
+function rdv_markdown_to_html(string $text): string
+{
+    $lines = preg_split('/\r\n|\r|\n/', $text);
+    $out = [];
+    $inCode = false;
+    $inUl = false;
+    $inOl = false;
+    $inBlockquote = false;
+
+    foreach ($lines as $line) {
+        if (trim($line) === '```') {
+            if ($inCode) {
+                $out[] = '</code></pre>';
+                $inCode = false;
+            } else {
+                $out[] = '<pre><code>';
+                $inCode = true;
+            }
+            continue;
+        }
+
+        if ($inCode) {
+            $out[] = htmlspecialchars($line, ENT_QUOTES);
+            continue;
+        }
+
+        $trim = ltrim($line);
+        if ($trim === '') {
+            if ($inUl) {
+                $out[] = '</ul>';
+                $inUl = false;
+            }
+            if ($inOl) {
+                $out[] = '</ol>';
+                $inOl = false;
+            }
+            if ($inBlockquote) {
+                $out[] = '</blockquote>';
+                $inBlockquote = false;
+            }
+            continue;
+        }
+
+        if (preg_match('/^(#{1,6})\s+(.*)$/', $trim, $m)) {
+            $level = strlen($m[1]);
+            $out[] = '<h' . $level . '>' . rdv_markdown_inline($m[2]) . '</h' . $level . '>';
+            continue;
+        }
+
+        if (preg_match('/^>\s?(.*)$/', $trim, $m)) {
+            if (!$inBlockquote) {
+                $out[] = '<blockquote>';
+                $inBlockquote = true;
+            }
+            $out[] = '<p>' . rdv_markdown_inline($m[1]) . '</p>';
+            continue;
+        }
+
+        if (preg_match('/^(\-|\*|\+)\s+(.*)$/', $trim, $m)) {
+            if (!$inUl) {
+                $out[] = '<ul>';
+                $inUl = true;
+            }
+            $out[] = '<li>' . rdv_markdown_inline($m[2]) . '</li>';
+            continue;
+        }
+
+        if (preg_match('/^\d+\.\s+(.*)$/', $trim, $m)) {
+            if (!$inOl) {
+                $out[] = '<ol>';
+                $inOl = true;
+            }
+            $out[] = '<li>' . rdv_markdown_inline($m[1]) . '</li>';
+            continue;
+        }
+
+        $out[] = '<p>' . rdv_markdown_inline($trim) . '</p>';
+    }
+
+    if ($inUl) {
+        $out[] = '</ul>';
+    }
+    if ($inOl) {
+        $out[] = '</ol>';
+    }
+    if ($inBlockquote) {
+        $out[] = '</blockquote>';
+    }
+    if ($inCode) {
+        $out[] = '</code></pre>';
+    }
+
+    return implode("\n", $out);
+}
+
+function rdv_csv_to_html(string $text, string $delimiter, int $maxRows = 200, int $maxCols = 50): string
+{
+    $lines = preg_split('/\r\n|\r|\n/', $text);
+    $rows = [];
+    foreach ($lines as $line) {
+        if ($line === '') {
+            continue;
+        }
+        $rows[] = str_getcsv($line, $delimiter);
+        if (count($rows) >= $maxRows) {
+            break;
+        }
+    }
+
+    if (!$rows) {
+        return '<p class="rdv-muted">No data to display.</p>';
+    }
+
+    $html = '<table><tbody>';
+    foreach ($rows as $row) {
+        $html .= '<tr>';
+        $cols = 0;
+        foreach ($row as $cell) {
+            $html .= '<td>' . htmlspecialchars($cell, ENT_QUOTES) . '</td>';
+            $cols++;
+            if ($cols >= $maxCols) {
+                break;
+            }
+        }
+        $html .= '</tr>';
+    }
+    $html .= '</tbody></table>';
+    return $html;
+}
+
+function rdv_get_libreoffice_path(): ?string
+{
+    $cfg = $GLOBALS['config']['files']['libreoffice_path'] ?? null;
+    if (is_string($cfg) && $cfg !== '') {
+        return $cfg;
+    }
+    $candidates = [
+        '/usr/bin/soffice',
+        '/usr/local/bin/soffice',
+        '/usr/lib/libreoffice/program/soffice',
+    ];
+    foreach ($candidates as $path) {
+        if (is_file($path) && is_executable($path)) {
+            return $path;
+        }
+    }
+    return null;
+}
+
+function rdv_file_uri(string $path): string
+{
+    $path = str_replace('\\', '/', $path);
+    $encoded = rawurlencode($path);
+    $encoded = str_replace('%2F', '/', $encoded);
+    return 'file://' . $encoded;
+}
+
+function rdv_mktemp_dir(string $prefix = 'rdv-'): ?string
+{
+    $base = sys_get_temp_dir();
+    $dir = $base . DIRECTORY_SEPARATOR . $prefix . bin2hex(random_bytes(6));
+    if (@mkdir($dir, 0700, true)) {
+        return $dir;
+    }
+    return null;
+}
+
+function rdv_cleanup_dir(string $dir): void
+{
+    if (!is_dir($dir)) {
+        return;
+    }
+    $items = glob($dir . DIRECTORY_SEPARATOR . '*');
+    if ($items) {
+        foreach ($items as $item) {
+            if (is_dir($item)) {
+                rdv_cleanup_dir($item);
+            } else {
+                @unlink($item);
+            }
+        }
+    }
+    @rmdir($dir);
+}
+
+function rdv_office_to_html(string $path): ?string
+{
+    if (!is_file($path)) {
+        return null;
+    }
+    if (!function_exists('shell_exec')) {
+        return null;
+    }
+    $bin = rdv_get_libreoffice_path();
+    if (!$bin) {
+        return null;
+    }
+
+    $tmpDir = rdv_mktemp_dir();
+    if (!$tmpDir) {
+        return null;
+    }
+    $profileDir = $tmpDir . DIRECTORY_SEPARATOR . 'profile';
+    @mkdir($profileDir, 0700, true);
+    $userInstall = rdv_file_uri($profileDir);
+
+    $cmd = escapeshellarg($bin)
+        . ' --headless --nologo --nodefault --nofirststartwizard --norestore --nolockcheck'
+        . ' -env:UserInstallation=' . escapeshellarg($userInstall)
+        . ' --convert-to html --outdir ' . escapeshellarg($tmpDir)
+        . ' ' . escapeshellarg($path);
+
+    shell_exec($cmd);
+
+    $htmlFiles = glob($tmpDir . DIRECTORY_SEPARATOR . '*.html');
+    $html = null;
+    if ($htmlFiles) {
+        $html = @file_get_contents($htmlFiles[0]);
+    }
+    rdv_cleanup_dir($tmpDir);
+
+    if (!is_string($html) || trim($html) === '') {
+        return null;
+    }
+    return rdv_sanitize_html($html, true);
+}
+
 // Handle actions
 $action = $_GET['action'] ?? 'browse';
 
 // Login / logout
 if ($action === 'login') {
     if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        rdv_require_safe_post_request();
         $username = trim((string)($_POST['username'] ?? ''));
         $password = (string)($_POST['password'] ?? '');
 
@@ -142,6 +780,7 @@ if ($action === 'login') {
 
             if ($row && !empty($row['active']) && !empty($row['password_hash']) &&
                 password_verify($password, $row['password_hash'])) {
+                session_regenerate_id(true);
                 $_SESSION['rounddav_files_user'] = $row['username'];
                 header('Location: ?action=browse');
                 exit;
@@ -254,6 +893,7 @@ if ($action === 'login') {
             <div class="error"><?= htmlspecialchars($error, ENT_QUOTES) ?></div>
         <?php endif; ?>
         <form method="post">
+            <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
             <label>Username
                 <input type="text" name="username" autocomplete="username" />
             </label>
@@ -275,14 +915,14 @@ if ($action === 'logout') {
     exit;
 }
 
-// Download handler (must be logged in)
-if ($action === 'download') {
+// Preview handler (must be logged in)
+if ($action === 'preview') {
     rdv_files_require_login();
     $user = rdv_files_current_user();
 
     $area = ($_GET['area'] ?? 'user') === 'shared' ? 'shared' : 'user';
-    $rel  = rdv_sanitize_relpath($_GET['path'] ?? '');
-    $file = $_GET['file'] ?? '';
+    $rel  = rdv_sanitize_relpath((string) ($_GET['path'] ?? ''));
+    $file = (string) ($_GET['file'] ?? '');
 
     if ($file === '') {
         http_response_code(400);
@@ -293,9 +933,60 @@ if ($action === 'download') {
     $base = $filesRoot . DIRECTORY_SEPARATOR . ($area === 'shared' ? 'shared' : ('users' . DIRECTORY_SEPARATOR . $user));
     rdv_ensure_dir($base);
 
-    $fullPath = $base . DIRECTORY_SEPARATOR . ($rel === '' ? '' : $rel . DIRECTORY_SEPARATOR) . $file;
+    $fullPath = rdv_resolve_existing_path($base, $rel, $file);
+    if ($fullPath === null) {
+        http_response_code(404);
+        echo 'File not found';
+        exit;
+    }
 
-    if (!is_file($fullPath)) {
+    $ext = strtolower(pathinfo($file, PATHINFO_EXTENSION));
+    $title = $file;
+    $body = '';
+
+    if (in_array($ext, ['txt','log','json','xml','ini','conf'], true)) {
+        $content = @file_get_contents($fullPath);
+        $body = '<pre>' . htmlspecialchars($content ?: '', ENT_QUOTES) . '</pre>';
+    } elseif (in_array($ext, ['csv','tsv'], true)) {
+        $content = @file_get_contents($fullPath);
+        $delimiter = $ext === 'tsv' ? "\t" : ',';
+        $body = rdv_csv_to_html($content ?: '', $delimiter);
+    } elseif (in_array($ext, ['md','markdown'], true)) {
+        $content = @file_get_contents($fullPath);
+        $body = rdv_markdown_to_html($content ?: '');
+    } elseif (in_array($ext, ['html','htm'], true)) {
+        $content = @file_get_contents($fullPath);
+        $body = rdv_sanitize_html($content ?: '');
+    } elseif (in_array($ext, ['doc','docx','odt','odf','xls','xlsx','ods'], true)) {
+        $body = rdv_office_to_html($fullPath) ?: '<p class="rdv-muted">Preview unavailable for this file. LibreOffice may not be configured.</p>';
+    } else {
+        $body = '<p class="rdv-muted">Preview not available for this file type.</p>';
+    }
+
+    rdv_preview_page($title, $body);
+    exit;
+}
+
+// Download handler (must be logged in)
+if ($action === 'download') {
+    rdv_files_require_login();
+    $user = rdv_files_current_user();
+
+    $area = ($_GET['area'] ?? 'user') === 'shared' ? 'shared' : 'user';
+    $rel  = rdv_sanitize_relpath((string) ($_GET['path'] ?? ''));
+    $file = (string) ($_GET['file'] ?? '');
+
+    if ($file === '') {
+        http_response_code(400);
+        echo 'Missing file parameter';
+        exit;
+    }
+
+    $base = $filesRoot . DIRECTORY_SEPARATOR . ($area === 'shared' ? 'shared' : ('users' . DIRECTORY_SEPARATOR . $user));
+    rdv_ensure_dir($base);
+
+    $fullPath = rdv_resolve_existing_path($base, $rel, $file);
+    if ($fullPath === null) {
         http_response_code(404);
         echo 'File not found';
         exit;
@@ -327,11 +1018,16 @@ $relPath = rdv_sanitize_relpath($_GET['path'] ?? '');
 
 // --- Admin detection (used for hiding delete in shared for non-admins) ---
 $adminConf = $config['admin'] ?? [];
-$admin_id  = $adminConf['password'] ?? '';
-$is_admin  = ($user && $admin_id && $user === $admin_id);
+$admin_id  = (string) ($adminConf['email'] ?? '');
+$admin_user = (string) ($adminConf['username'] ?? '');
+$admin_legacy = (string) ($adminConf['password'] ?? '');
+$admin_identity = $admin_id !== '' ? $admin_id : ($admin_user !== '' ? $admin_user : $admin_legacy);
+$is_admin  = ($user && $admin_identity !== '' && $user === $admin_identity);
 
-// Whether delete is allowed in this view
-$canDeleteHere = !($area === 'shared' && !$is_admin);
+$sharedWritePolicy = strtolower((string) ($config['files']['shared_write_policy'] ?? 'admins_only'));
+$sharedWriteAllowed = $sharedWritePolicy === 'authenticated_users' ? true : $is_admin;
+// Whether destructive actions are allowed in this view.
+$canDeleteHere = !($area === 'shared' && !$sharedWriteAllowed);
 
 $base = $filesRoot . DIRECTORY_SEPARATOR . ($area === 'shared' ? 'shared' : ('users' . DIRECTORY_SEPARATOR . $user));
 rdv_ensure_dir($base);
@@ -344,6 +1040,15 @@ rdv_ensure_dir($dirPath);
 
 // Handle POST actions: upload, mkdir, delete, delete_multi, move, move_multi
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    rdv_require_safe_post_request();
+
+    $canWriteHere = !($area === 'shared' && !$sharedWriteAllowed);
+    if (!$canWriteHere) {
+        http_response_code(403);
+        echo 'Forbidden';
+        exit;
+    }
+
     $postAction  = $_POST['do'] ?? '';
     $redirectUrl = '?action=browse&area=' . urlencode($area) . '&path=' . urlencode($relPath);
 
@@ -562,7 +1267,9 @@ $viewableExtensions = [
     'jpg','jpeg','png','gif','webp','svg',
     'pdf',
     'html','htm',
-    'csv','json','xml','ini','conf',
+    'csv','tsv','json','xml','ini','conf',
+    'doc','docx','odt','odf',
+    'xls','xlsx','ods',
     // audio
     'mp3','ogg','wav','flac','m4a',
     // video
@@ -834,7 +1541,7 @@ $viewableExtensions = [
         /* Folder "has content" badge */
         .folder-row.folder-nonempty .folder-label::after {
             content: '🗐';
-            display: inline-block;
+            display: inline;
             margin-left: 4px;
             font-size: 15px;
             font-style: normal;
@@ -861,7 +1568,7 @@ $viewableExtensions = [
             width: min(960px, 90vw);
             height: min(640px, 90vh);
             background: #d6d6d6 !important;
-            color: #f3f4f6;
+            color: #000;
             border-radius: 10px;
             box-shadow: 0 25px 60px rgba(0,0,0,0.75);
             display: flex;
@@ -914,6 +1621,7 @@ $viewableExtensions = [
             max-height: 100%;
             overflow: auto;
             background: #d6d6d6;
+            color: #000 !important;
             padding: 16px;
             border-radius: 8px;
             font-size: 13px;
@@ -994,22 +1702,26 @@ $viewableExtensions = [
 
     <div class="toolbar">
 
-        <div id="rdv-dropzone" class="dropzone" aria-label="Upload files by drag and drop">
-            <span class="dropzone-primary">Drop files here</span>
-            <span class="dropzone-secondary">or click to browse</span>
-        </div>
-        
-        <form method="post" enctype="multipart/form-data" id="rdv-upload-form">
-            <input type="hidden" name="do" value="upload" />
-            <input type="file" name="file[]" id="rdv-file-input" multiple />
-            <button type="submit">Upload</button>
-        </form>
+        <?php if ($area !== 'shared' || $sharedWriteAllowed): ?>
+            <div id="rdv-dropzone" class="dropzone" aria-label="Upload files by drag and drop">
+                <span class="dropzone-primary">Drop files here</span>
+                <span class="dropzone-secondary">or click to browse</span>
+            </div>
 
-        <form class="toolbar-right" method="post">
-            <input type="hidden" name="do" value="mkdir" />
-            <input type="text" name="dirname" placeholder="New folder name" />
-            <button type="submit">Create folder</button>
-        </form>
+            <form method="post" enctype="multipart/form-data" id="rdv-upload-form">
+                <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
+                <input type="hidden" name="do" value="upload" />
+                <input type="file" name="file[]" id="rdv-file-input" multiple />
+                <button type="submit">Upload</button>
+            </form>
+
+            <form class="toolbar-right" method="post">
+                <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
+                <input type="hidden" name="do" value="mkdir" />
+                <input type="text" name="dirname" placeholder="New folder name" />
+                <button type="submit">Create folder</button>
+            </form>
+        <?php endif; ?>
 
         <?php if ($canDeleteHere): ?>
             <button type="button" id="bulk-delete-btn" style="display:none;">Delete selected</button>
@@ -1049,6 +1761,7 @@ $viewableExtensions = [
                 <td width="10%" align="center">
                     <?php if ($canDeleteHere): ?>
                         <form method="post" style="display:inline" onsubmit="return confirm('Delete <?= htmlspecialchars($e['name'], ENT_QUOTES) ?>?');">
+                            <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
                             <input type="hidden" name="do" value="delete" />
                             <input type="hidden" name="item" value="<?= htmlspecialchars($e['name'], ENT_QUOTES) ?>" />
                             <button type="submit" class="delete-button">Delete</button>
@@ -1076,6 +1789,7 @@ $viewableExtensions = [
                 <td width="10%" align="center">
                     <?php if ($canDeleteHere): ?>
                         <form method="post" style="display:inline" onsubmit="return confirm('Delete <?= htmlspecialchars($e['name'], ENT_QUOTES) ?>?');">
+                            <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
                             <input type="hidden" name="do" value="delete" />
                             <input type="hidden" name="item" value="<?= htmlspecialchars($e['name'], ENT_QUOTES) ?>" />
                             <button type="submit" class="delete-button">Delete</button>
@@ -1094,6 +1808,7 @@ $viewableExtensions = [
 
 <!-- Hidden move forms for internal drag-to-move -->
 <form id="move-form" method="post" style="display:none;">
+    <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
     <input type="hidden" name="do" value="move" />
     <input type="hidden" name="item" id="move-item" />
     <input type="hidden" name="from_path" id="move-from" />
@@ -1101,6 +1816,7 @@ $viewableExtensions = [
 </form>
 
 <form id="bulk-move-form" method="post" style="display:none;">
+    <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
     <input type="hidden" name="do" value="move_multi" />
     <input type="hidden" name="items" id="bulk-move-items" />
     <input type="hidden" name="from_path" id="bulk-move-from" />
@@ -1108,6 +1824,7 @@ $viewableExtensions = [
 </form>
 
 <form id="bulk-delete-form" method="post" style="display:none;">
+    <input type="hidden" name="_rdv_csrf" value="<?= htmlspecialchars(rdv_csrf_token(), ENT_QUOTES) ?>" />
     <input type="hidden" name="do" value="delete_multi" />
     <input type="hidden" name="items" id="bulk-delete-items" />
     <input type="hidden" name="from_path" id="bulk-delete-from" />
@@ -1210,8 +1927,11 @@ $viewableExtensions = [
         if (['mp3','ogg','wav','flac','m4a'].indexOf(ext) !== -1) return 'audio';
         if (['mp4','m4v','mov','webm','ogv'].indexOf(ext) !== -1) return 'video';
         if (['pdf'].indexOf(ext) !== -1) return 'pdf';
-        if (['txt','log','md','markdown','csv','json','xml','ini','conf'].indexOf(ext) !== -1) return 'text';
+        if (['txt','log','json','xml','ini','conf'].indexOf(ext) !== -1) return 'text';
         if (['html','htm'].indexOf(ext) !== -1) return 'html';
+        if (['md','markdown'].indexOf(ext) !== -1) return 'markdown';
+        if (['doc','docx','odt','odf'].indexOf(ext) !== -1) return 'doc';
+        if (['csv','tsv','xls','xlsx','ods'].indexOf(ext) !== -1) return 'sheet';
         return 'other';
     }
 
@@ -1304,29 +2024,13 @@ $viewableExtensions = [
             frame.style.height = '100%';
             frame.loading = 'lazy';
             content.appendChild(frame);
-        } else if (type === 'html') {
-            var htmlFrame = document.createElement('iframe');
-            htmlFrame.src = src;
-            htmlFrame.style.width = '100%';
-            htmlFrame.style.height = '100%';
-            content.appendChild(htmlFrame);
-        } else if (type === 'text') {
-            fetch(src, { credentials: 'include' })
-                .then(function(resp) {
-                    if (!resp.ok) throw new Error('Failed');
-                    return resp.text();
-                })
-                .then(function(text) {
-                    var pre = document.createElement('pre');
-                    pre.textContent = text;
-                    content.appendChild(pre);
-                })
-                .catch(function() {
-                    var fallback = document.createElement('div');
-                    fallback.className = 'rdv-preview-empty';
-                    fallback.textContent = 'Unable to load text preview.';
-                    content.appendChild(fallback);
-                });
+        } else if (type === 'html' || type === 'text' || type === 'markdown' || type === 'doc' || type === 'sheet') {
+            var previewFrame = document.createElement('iframe');
+            previewFrame.src = ensurePreview(entry.href);
+            previewFrame.style.width = '100%';
+            previewFrame.style.height = '100%';
+            previewFrame.loading = 'lazy';
+            content.appendChild(previewFrame);
         } else {
             var msg = document.createElement('div');
             msg.className = 'rdv-preview-empty';
@@ -1346,6 +2050,17 @@ $viewableExtensions = [
             return url;
         }
         return url + (url.indexOf('?') === -1 ? '?' : '&') + 'inline=1';
+    }
+
+    function ensurePreview(url) {
+        try {
+            var u = new URL(url, window.location.href);
+            u.searchParams.set('action', 'preview');
+            u.searchParams.delete('inline');
+            return u.toString();
+        } catch (e) {
+            return url.replace('action=download', 'action=preview');
+        }
     }
 
     function closeModal() {

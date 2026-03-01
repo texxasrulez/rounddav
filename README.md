@@ -122,7 +122,7 @@ return [
 
     'admin' => [
         'username'      => 'admin',
-        'password'      => 'admin@example.com',  // used to match admin principal
+        'email'         => 'admin@example.com',
         'password_hash' => '$2y$10$...',
     ],
 
@@ -143,9 +143,10 @@ Key points:
 
 - `files.root` – base directory for per-user WebDAV storage.
 - `files.public_url` – where the browser reaches the Files UI.
-- `admin.password` – used in your templates to identify the admin user.
+- `admin.email` (or `admin.username`) – use this to identify the admin user in templates.
 - `provision.shared_secret` – for API calls if you ever protect them further.
 - `sso.secret` – must match `rounddav_sso_secret` in the Roundcube `rounddav_provision` plugin.
+- `security.headers` – optional response headers. Leave `x_frame_options` empty (default) if Files UI must be embedded by Roundcube on a different origin.
 
 ---
 
@@ -255,6 +256,55 @@ You can:
 The Admin UI is intentionally minimal, built for admins who already know what DAV is.
 
 [Admin README.md](README_rounddav_admin.md)
+
+---
+
+## Config Backup, Restore, and Embed-Safe Security Settings
+
+The Admin UI (`/public/admin/?action=config`) now includes config snapshot and backup tools for `config/config.php`.
+
+### Backup and restore workflow
+
+In **Config Snapshot**:
+
+- **Create backup now** writes a timestamped `config-YYYYmmdd-HHMMSS-xxxxxxxx.php` file under `var/config_backups/`
+- **Download** exports a single backup file
+- **Restore** replaces the live `config.php` with the selected backup
+- **Download all as ZIP** streams all backups as one archive for off-host storage
+
+RoundDAV also creates a backup automatically before config writes/imports/restores.
+
+### Retention policy
+
+Retention is configurable in the same card:
+
+- **Keep newest backups** (`backups.config.keep_last`)
+- **Delete backups older than days** (`backups.config.max_age_days`, `0` disables age pruning)
+- **Auto-prune after config writes/restores/backups** (`backups.config.auto_prune`)
+
+Defaults in `config/config.dist.php`:
+
+```php
+'backups' => [
+    'config' => [
+        'keep_last' => 30,
+        'max_age_days' => 0,
+        'auto_prune' => true,
+    ],
+],
+```
+
+### Recommended settings for Roundcube iframe embedding
+
+If `rounddav_files` is shown inside Roundcube via iframe (especially cross-origin):
+
+- Keep `security.headers.enabled = true`
+- Keep `security.headers.x_content_type_options = true`
+- Keep `security.headers.referrer_policy = strict-origin-when-cross-origin`
+- Keep `security.headers.x_frame_options = ''` (empty; do not set `SAMEORIGIN`/`DENY` for cross-origin embeds)
+- If CSP is enabled, ensure `frame-ancestors` includes your Roundcube origin (for example `https://mail.example.com`)
+
+Use **Verify Current Headers** in the Security diagnostics panel to confirm live responses from Admin/Files endpoints match expected values.
 
 ---
 

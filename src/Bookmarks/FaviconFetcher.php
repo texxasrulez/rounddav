@@ -43,10 +43,11 @@ class FaviconFetcher
         }
 
         curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
-        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
-        curl_setopt($ch, CURLOPT_MAXREDIRS, 3);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, false);
         curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, $this->timeout);
         curl_setopt($ch, CURLOPT_TIMEOUT, $this->timeout);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, 2);
         curl_setopt($ch, CURLOPT_USERAGENT, 'RoundDAV-FaviconFetcher');
         curl_setopt($ch, CURLOPT_WRITEFUNCTION, function ($ch, $data) use (&$buffer) {
             $chunkLen = strlen($data);
@@ -103,13 +104,92 @@ class FaviconFetcher
 
         $scheme = $parts['scheme'] ?? 'https';
         $host   = strtolower($parts['host']);
-        $port   = isset($parts['port']) ? ':' . (int) $parts['port'] : '';
+        $portNum = isset($parts['port']) ? (int) $parts['port'] : null;
+        $port   = $portNum ? ':' . $portNum : '';
 
         if (!in_array($scheme, ['http', 'https'], true)) {
             $scheme = 'https';
         }
 
+        if ($portNum !== null && !in_array($portNum, [80, 443], true)) {
+            return null;
+        }
+
+        if ($this->isBlockedHost($host)) {
+            return null;
+        }
+
+        if (!$this->hostResolvesToPublicIp($host)) {
+            return null;
+        }
+
         return sprintf('%s://%s%s/favicon.ico', $scheme, $host, $port);
+    }
+
+    private function isBlockedHost(string $host): bool
+    {
+        if ($host === '' || $host === 'localhost') {
+            return true;
+        }
+
+        if (filter_var($host, FILTER_VALIDATE_IP)) {
+            return !$this->isPublicIp($host);
+        }
+
+        return false;
+    }
+
+    private function hostResolvesToPublicIp(string $host): bool
+    {
+        $ips = [];
+
+        if (function_exists('dns_get_record')) {
+            $recordsA = @dns_get_record($host, DNS_A);
+            if (is_array($recordsA)) {
+                foreach ($recordsA as $record) {
+                    if (!empty($record['ip'])) {
+                        $ips[] = $record['ip'];
+                    }
+                }
+            }
+
+            if (defined('DNS_AAAA')) {
+                $recordsAAAA = @dns_get_record($host, DNS_AAAA);
+                if (is_array($recordsAAAA)) {
+                    foreach ($recordsAAAA as $record) {
+                        if (!empty($record['ipv6'])) {
+                            $ips[] = $record['ipv6'];
+                        }
+                    }
+                }
+            }
+        } elseif (function_exists('gethostbynamel')) {
+            $resolved = @gethostbynamel($host);
+            if (is_array($resolved)) {
+                $ips = $resolved;
+            }
+        }
+
+        if (!$ips) {
+            return false;
+        }
+
+        foreach ($ips as $ip) {
+            if ($this->isPublicIp((string) $ip)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private function isPublicIp(string $ip): bool
+    {
+        return filter_var(
+            $ip,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+        ) !== false;
     }
 
     private function guessMime(string $data): ?string

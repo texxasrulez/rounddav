@@ -24,6 +24,17 @@ if (!file_exists($configFile)) {
 }
 $config = require $configFile;
 
+$rate = \RoundDAV\Security\RateLimitGuard::checkAndConsume($config, 'files_attach');
+foreach (\RoundDAV\Security\RateLimitGuard::headerMap($rate) as $name => $value) {
+    header($name . ': ' . $value);
+}
+if (empty($rate['allowed'])) {
+    http_response_code(429);
+    header('Content-Type: text/plain; charset=utf-8');
+    echo "Too Many Requests\n";
+    exit;
+}
+
 $db = $config['database'] ?? [];
 try {
     $pdo = new \PDO(
@@ -84,6 +95,43 @@ function rdv_sanitize_relpath(string $path): string
     return implode('/', $parts);
 }
 
+function rdv_sanitize_filename(string $file): string
+{
+    $file = str_replace(["\0", '/', '\\'], '', (string) $file);
+    return trim($file);
+}
+
+function rdv_resolve_existing_path(string $base, string $rel, string $file): ?string
+{
+    $rel  = rdv_sanitize_relpath($rel);
+    $file = rdv_sanitize_filename($file);
+
+    if ($file === '') {
+        return null;
+    }
+
+    $baseReal = realpath($base);
+    if ($baseReal === false || !is_dir($baseReal)) {
+        return null;
+    }
+
+    $candidate = $baseReal . DIRECTORY_SEPARATOR
+        . ($rel === '' ? '' : $rel . DIRECTORY_SEPARATOR)
+        . $file;
+
+    $pathReal = realpath($candidate);
+    if ($pathReal === false || !is_file($pathReal)) {
+        return null;
+    }
+
+    $basePrefix = rtrim($baseReal, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+    if (strncmp($pathReal, $basePrefix, strlen($basePrefix)) !== 0) {
+        return null;
+    }
+
+    return $pathReal;
+}
+
 /**
  * Ensure a directory exists (mkdir -p behavior).
  */
@@ -91,6 +139,106 @@ function rdv_ensure_dir(string $dir): void
 {
     if (!is_dir($dir)) {
         @mkdir($dir, 0770, true);
+    }
+}
+
+function rdv_normalize_host(string $host): string
+{
+    $host = trim($host);
+    if ($host === '') {
+        return '';
+    }
+
+    if ($host[0] === '[') {
+        $end = strpos($host, ']');
+        if ($end !== false) {
+            return strtolower(substr($host, 1, $end - 1));
+        }
+    }
+
+    return strtolower(trim(explode(':', $host)[0]));
+}
+
+function rdv_proxy_headers_trusted(): bool
+{
+    $security = $GLOBALS['config']['security'] ?? [];
+    return !empty($security['trust_proxy_headers']);
+}
+
+function rdv_request_hosts(): array
+{
+    $hosts = [];
+
+    $host = rdv_normalize_host((string) ($_SERVER['HTTP_HOST'] ?? ''));
+    if ($host !== '') {
+        $hosts[] = $host;
+    }
+
+    if (rdv_proxy_headers_trusted()) {
+        $xfHost = trim((string) ($_SERVER['HTTP_X_FORWARDED_HOST'] ?? ''));
+        if ($xfHost !== '') {
+            foreach (explode(',', $xfHost) as $item) {
+                $candidate = rdv_normalize_host($item);
+                if ($candidate !== '') {
+                    $hosts[] = $candidate;
+                }
+            }
+        }
+    }
+
+    return array_values(array_unique($hosts));
+}
+
+function rdv_host_matches_url(string $url, array $hosts): bool
+{
+    $parts = @parse_url($url);
+    if (!is_array($parts) || empty($parts['host'])) {
+        return false;
+    }
+
+    $urlHost = strtolower((string) $parts['host']);
+    if ($urlHost === '' || !$hosts) {
+        return false;
+    }
+
+    return in_array($urlHost, $hosts, true);
+}
+
+function rdv_request_is_same_origin(): bool
+{
+    $hosts = rdv_request_hosts();
+    if (!$hosts) {
+        return true;
+    }
+
+    $origin = trim((string) ($_SERVER['HTTP_ORIGIN'] ?? ''));
+    if ($origin !== '') {
+        return rdv_host_matches_url($origin, $hosts);
+    }
+
+    $referer = trim((string) ($_SERVER['HTTP_REFERER'] ?? ''));
+    if ($referer !== '') {
+        return rdv_host_matches_url($referer, $hosts);
+    }
+
+    $secFetchSite = strtolower(trim((string) ($_SERVER['HTTP_SEC_FETCH_SITE'] ?? '')));
+    if ($secFetchSite === 'cross-site') {
+        return false;
+    }
+
+    return true;
+}
+
+function rdv_require_safe_post_request(): void
+{
+    if (($_SERVER['REQUEST_METHOD'] ?? 'GET') !== 'POST') {
+        return;
+    }
+
+    if (!rdv_request_is_same_origin()) {
+        http_response_code(403);
+        echo 'Cross-site POST denied';
+        exit;
     }
 }
 
@@ -142,6 +290,7 @@ if ($action === 'login') {
 
             if ($row && !empty($row['active']) && !empty($row['password_hash']) &&
                 password_verify($password, $row['password_hash'])) {
+                session_regenerate_id(true);
                 $_SESSION['rounddav_files_user'] = $row['username'];
                 header('Location: ?action=browse');
                 exit;
@@ -281,8 +430,8 @@ if ($action === 'download') {
     $user = rdv_files_current_user();
 
     $area = ($_GET['area'] ?? 'user') === 'shared' ? 'shared' : 'user';
-    $rel  = rdv_sanitize_relpath($_GET['path'] ?? '');
-    $file = $_GET['file'] ?? '';
+    $rel  = rdv_sanitize_relpath((string) ($_GET['path'] ?? ''));
+    $file = (string) ($_GET['file'] ?? '');
 
     if ($file === '') {
         http_response_code(400);
@@ -293,9 +442,8 @@ if ($action === 'download') {
     $base = $filesRoot . DIRECTORY_SEPARATOR . ($area === 'shared' ? 'shared' : ('users' . DIRECTORY_SEPARATOR . $user));
     rdv_ensure_dir($base);
 
-    $fullPath = $base . DIRECTORY_SEPARATOR . ($rel === '' ? '' : $rel . DIRECTORY_SEPARATOR) . $file;
-
-    if (!is_file($fullPath)) {
+    $fullPath = rdv_resolve_existing_path($base, $rel, $file);
+    if ($fullPath === null) {
         http_response_code(404);
         echo 'File not found';
         exit;
@@ -330,8 +478,10 @@ $adminConf = $config['admin'] ?? [];
 $admin_id  = $adminConf['password'] ?? '';
 $is_admin  = ($user && $admin_id && $user === $admin_id);
 
-// Whether delete is allowed in this view
-$canDeleteHere = !($area === 'shared' && !$is_admin);
+$sharedWritePolicy = strtolower((string) ($config['files']['shared_write_policy'] ?? 'admins_only'));
+$sharedWriteAllowed = $sharedWritePolicy === 'authenticated_users' ? true : $is_admin;
+// Whether destructive actions are allowed in this view.
+$canDeleteHere = !($area === 'shared' && !$sharedWriteAllowed);
 
 $base = $filesRoot . DIRECTORY_SEPARATOR . ($area === 'shared' ? 'shared' : ('users' . DIRECTORY_SEPARATOR . $user));
 rdv_ensure_dir($base);
@@ -344,6 +494,15 @@ rdv_ensure_dir($dirPath);
 
 // Handle POST actions: upload, mkdir, delete, delete_multi, move, move_multi
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    rdv_require_safe_post_request();
+
+    $canWriteHere = !($area === 'shared' && !$sharedWriteAllowed);
+    if (!$canWriteHere) {
+        http_response_code(403);
+        echo 'Forbidden';
+        exit;
+    }
+
     $postAction  = $_POST['do'] ?? '';
     $redirectUrl = '?action=browse&area=' . urlencode($area) . '&path=' . urlencode($relPath);
 

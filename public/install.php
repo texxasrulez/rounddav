@@ -20,8 +20,19 @@ function h(string $s): string
     return htmlspecialchars($s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
 }
 
+function rdv_generate_secret(int $bytes = 32): string
+{
+    try {
+        return bin2hex(random_bytes(max(16, $bytes)));
+    } catch (Throwable $e) {
+        return hash('sha256', uniqid('rounddav', true) . microtime(true));
+    }
+}
+
 $errors = [];
 $done   = false;
+$generatedProvisionSecret = null;
+$generatedSsoSecret       = null;
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $dbHost       = trim((string)($_POST['db_host'] ?? ''));
@@ -120,7 +131,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     $config['admin']['username']      = $adminUser;
                     $config['admin']['password_hash'] = $hash;
                     $config['admin']['email'] = $adminEmail;
-                    $config['admin']['password'] = $adminEmail;
 
                     // Optional files root override / enabling
                     if (!isset($config['files']) || !is_array($config['files'])) {
@@ -133,22 +143,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         $config['files']['enabled'] = true;
                     }
 
-                    // Optional provisioning shared_secret override
+                    // Provisioning shared secret.
                     if (!isset($config['provision']) || !is_array($config['provision'])) {
                         $config['provision'] = [];
                     }
-                    if ($sharedSecret !== '') {
-                        $config['provision']['shared_secret'] = $sharedSecret;
+                    if ($sharedSecret === '') {
+                        $sharedSecret = rdv_generate_secret();
+                        $generatedProvisionSecret = $sharedSecret;
                     }
-                    // If left empty, we keep whatever is in config.dist.php (e.g. change_me_provision)
+                    $config['provision']['shared_secret'] = $sharedSecret;
 
-                    // Optional SSO shared secret override
+                    // SSO shared secret.
                     if (!isset($config['sso']) || !is_array($config['sso'])) {
                         $config['sso'] = [];
                     }
-                    if ($ssoSecret !== '') {
-                        $config['sso']['secret'] = $ssoSecret;
+                    if ($ssoSecret === '') {
+                        $ssoSecret = rdv_generate_secret();
+                        $generatedSsoSecret = $ssoSecret;
                     }
+                    $config['sso']['secret'] = $ssoSecret;
 
                     $export = "<?php\nreturn " . var_export($config, true) . ";\n";
 
@@ -230,6 +243,15 @@ if ($done) {
             <h1>RoundDAV Installed</h1>
             <p>Installation completed successfully.</p>
             <p>You can now launch the DAV endpoint or open the admin console.</p>
+            <?php if ($generatedProvisionSecret !== null || $generatedSsoSecret !== null): ?>
+                <p><strong>Generated secrets</strong> (save these now):</p>
+                <?php if ($generatedProvisionSecret !== null): ?>
+                    <p>Provision token: <code><?= h($generatedProvisionSecret) ?></code></p>
+                <?php endif; ?>
+                <?php if ($generatedSsoSecret !== null): ?>
+                    <p>SSO secret: <code><?= h($generatedSsoSecret) ?></code></p>
+                <?php endif; ?>
+            <?php endif; ?>
             <p>
                 <a class="button" href="index.php">Launch RoundDAV</a>
             </p>

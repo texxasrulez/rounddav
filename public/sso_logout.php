@@ -32,7 +32,9 @@ if ($user === '' || $ts === '' || $sig === '') {
     exit;
 }
 
-if (!ctype_digit((string)$ts) || (time() - (int)$ts) > $ttl) {
+$tsInt = (int) $ts;
+$now   = time();
+if (!ctype_digit((string)$ts) || ($now - $tsInt) > $ttl || $tsInt > ($now + 300)) {
     error_log('[rounddav sso_logout] Token expired or invalid ts');
     // Token too old, just bail
     exit;
@@ -42,7 +44,7 @@ $data     = $user . '|' . $ts . '|logout';
 $expected = hash_hmac('sha256', $data, $secret);
 
 if (!hash_equals($expected, (string)$sig)) {
-    error_log('[rounddav sso_logout] Invalid signature for user=' . var_export($user, true));
+    error_log('[rounddav sso_logout] Invalid signature');
     // Invalid signature, ignore
     exit;
 }
@@ -63,6 +65,6 @@ if (ini_get('session.use_cookies')) {
     );
 }
 
-error_log('[rounddav sso_logout] Destroying session for user=' . var_export($user, true));
+error_log('[rounddav sso_logout] Destroying session');
 session_destroy();
 exit;

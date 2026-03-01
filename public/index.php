@@ -24,9 +24,11 @@ try {
     // Very basic error handler to avoid white screen of death
     http_response_code(500);
     header('Content-Type: text/plain; charset=utf-8');
-    echo "RoundDAV fatal error:\n\n";
-    echo $e->getMessage() . "\n";
     if (!empty($config['debug'])) {
+        echo "RoundDAV fatal error:\n\n";
+        echo $e->getMessage() . "\n";
         echo "\nTrace:\n" . $e->getTraceAsString();
+    } else {
+        echo "RoundDAV fatal error.\n";
     }
 }

@@ -2,8 +2,7 @@
 declare(strict_types=1);
 
 use RoundDAV\Provision\ApiController;
-use PDO;
-use PDOException;
+use RoundDAV\Security\RateLimitGuard;
 
 // No BOM, no whitespace before this tag.
 // This script is the RoundDAV provisioning API front controller.
@@ -42,6 +41,19 @@ if (!is_array($config) || empty($config['database']['dsn'])) {
     echo json_encode([
         'status'  => 'error',
         'message' => 'Invalid RoundDAV configuration (database settings missing)',
+    ]);
+    exit;
+}
+
+$rate = RateLimitGuard::checkAndConsume($config, 'api');
+foreach (RateLimitGuard::headerMap($rate) as $name => $value) {
+    header($name . ': ' . $value);
+}
+if (empty($rate['allowed'])) {
+    http_response_code(429);
+    echo json_encode([
+        'status'  => 'error',
+        'message' => 'Too Many Requests',
     ]);
     exit;
 }
