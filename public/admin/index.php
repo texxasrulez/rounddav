@@ -2434,6 +2434,22 @@ function rdv_render_header(string $title = 'RoundDAV Admin'): void
         grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
         gap: 16px;
     }
+    .form-card.full-width {
+        grid-column: 1 / -1;
+    }
+    .security-headers-columns {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+    }
+    .security-headers-column {
+        min-width: 0;
+    }
+    @media (max-width: 980px) {
+        .security-headers-columns {
+            grid-template-columns: 1fr;
+        }
+    }
     .stacked-form label {
         display: block;
         margin-bottom: 10px;
@@ -3885,43 +3901,6 @@ elseif ($action === 'config'): ?>
       </label>
     </div>
     <div class="form-card stacked-form">
-      <h3>Security Headers</h3>
-      <label>
-        <input type="checkbox" name="headers_enabled" value="1" <?= !array_key_exists('enabled', (array) ($config['security']['headers'] ?? [])) || !empty($config['security']['headers']['enabled']) ? 'checked' : '' ?>>
-        Enable response security headers on Admin/Files pages
-      </label>
-      <label>
-        <input type="checkbox" name="headers_nosniff" value="1" <?= !array_key_exists('x_content_type_options', (array) ($config['security']['headers'] ?? [])) || !empty($config['security']['headers']['x_content_type_options']) ? 'checked' : '' ?>>
-        Send <code>X-Content-Type-Options: nosniff</code>
-      </label>
-      <label>Referrer-Policy<br>
-        <input type="text" name="headers_referrer_policy" value="<?= rdv_html((string) ($config['security']['headers']['referrer_policy'] ?? 'strict-origin-when-cross-origin')) ?>">
-      </label>
-      <label>Permissions-Policy<br>
-        <input type="text" name="headers_permissions_policy" value="<?= rdv_html((string) ($config['security']['headers']['permissions_policy'] ?? 'camera=(), microphone=(), geolocation=(), payment=(), usb=()')) ?>">
-      </label>
-      <label>X-Frame-Options<br>
-        <?php $xfoValue = strtoupper((string) ($config['security']['headers']['x_frame_options'] ?? '')); ?>
-        <select name="headers_x_frame_options">
-          <option value="" <?= $xfoValue === '' ? 'selected' : '' ?>>Disabled (allow embedding)</option>
-          <option value="SAMEORIGIN" <?= $xfoValue === 'SAMEORIGIN' ? 'selected' : '' ?>>SAMEORIGIN</option>
-          <option value="DENY" <?= $xfoValue === 'DENY' ? 'selected' : '' ?>>DENY</option>
-        </select>
-      </label>
-      <label>
-        <input type="checkbox" name="headers_csp_enabled" value="1" <?= !empty($config['security']['headers']['csp']['enabled']) ? 'checked' : '' ?>>
-        Enable Content-Security-Policy
-      </label>
-      <label>CSP policy override (optional)<br>
-        <textarea name="headers_csp_policy" rows="4" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;"><?= rdv_html((string) ($config['security']['headers']['csp']['policy'] ?? '')) ?></textarea>
-        <span class="hint">Leave blank to auto-generate a basic policy using frame-ancestors below.</span>
-      </label>
-      <label>CSP frame-ancestors (one per line or comma-separated)<br>
-        <textarea name="headers_csp_frame_ancestors" rows="3" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;"><?= rdv_html(is_array($config['security']['headers']['csp']['frame_ancestors'] ?? null) ? implode("\n", $config['security']['headers']['csp']['frame_ancestors']) : "'self'") ?></textarea>
-        <span class="hint">For cross-origin Roundcube embedding, keep X-Frame-Options disabled and include your Roundcube origin (e.g. <code>https://mail.example.com</code>).</span>
-      </label>
-    </div>
-    <div class="form-card stacked-form">
       <h3>Provisioning</h3>
       <label>Base URL<br>
         <input type="text" name="provision_baseurl" value="<?= rdv_html((string) ($config['provision']['baseurl'] ?? '')) ?>">
@@ -3985,6 +3964,51 @@ elseif ($action === 'config'): ?>
       <label>New password (optional)<br>
         <input type="password" name="admin_password" placeholder="Leave blank to keep current password">
       </label>
+    </div>
+    <div class="form-card stacked-form full-width">
+      <h3>Security Headers</h3>
+      <div class="security-headers-columns">
+        <div class="security-headers-column">
+          <label>
+            <input type="checkbox" name="headers_enabled" value="1" <?= !array_key_exists('enabled', (array) ($config['security']['headers'] ?? [])) || !empty($config['security']['headers']['enabled']) ? 'checked' : '' ?>>
+            Enable response security headers on Admin/Files pages
+          </label>
+          <label>
+            <input type="checkbox" name="headers_nosniff" value="1" <?= !array_key_exists('x_content_type_options', (array) ($config['security']['headers'] ?? [])) || !empty($config['security']['headers']['x_content_type_options']) ? 'checked' : '' ?>>
+            Send <code>X-Content-Type-Options: nosniff</code>
+          </label>
+          <label>Referrer-Policy<br>
+            <input type="text" name="headers_referrer_policy" value="<?= rdv_html((string) ($config['security']['headers']['referrer_policy'] ?? 'strict-origin-when-cross-origin')) ?>">
+          </label>
+        </div>
+        <div class="security-headers-column">
+          <label>Permissions-Policy<br>
+            <input type="text" name="headers_permissions_policy" value="<?= rdv_html((string) ($config['security']['headers']['permissions_policy'] ?? 'camera=(), microphone=(), geolocation=(), payment=(), usb=()')) ?>">
+          </label>
+          <label>X-Frame-Options<br>
+            <?php $xfoValue = strtoupper((string) ($config['security']['headers']['x_frame_options'] ?? '')); ?>
+            <select name="headers_x_frame_options">
+              <option value="" <?= $xfoValue === '' ? 'selected' : '' ?>>Disabled (allow embedding)</option>
+              <option value="SAMEORIGIN" <?= $xfoValue === 'SAMEORIGIN' ? 'selected' : '' ?>>SAMEORIGIN</option>
+              <option value="DENY" <?= $xfoValue === 'DENY' ? 'selected' : '' ?>>DENY</option>
+            </select>
+          </label>
+          <label>
+            <input type="checkbox" name="headers_csp_enabled" value="1" <?= !empty($config['security']['headers']['csp']['enabled']) ? 'checked' : '' ?>>
+            Enable Content-Security-Policy
+          </label>
+        </div>
+        <div class="security-headers-column">
+          <label>CSP policy override (optional)<br>
+            <textarea name="headers_csp_policy" rows="4" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;"><?= rdv_html((string) ($config['security']['headers']['csp']['policy'] ?? '')) ?></textarea>
+            <span class="hint">Leave blank to auto-generate a basic policy using frame-ancestors below.</span>
+          </label>
+          <label>CSP frame-ancestors (one per line or comma-separated)<br>
+            <textarea name="headers_csp_frame_ancestors" rows="3" style="width:100%;background:#020617;border:1px solid #1f2937;border-radius:8px;color:#e5e7eb;"><?= rdv_html(is_array($config['security']['headers']['csp']['frame_ancestors'] ?? null) ? implode("\n", $config['security']['headers']['csp']['frame_ancestors']) : "'self'") ?></textarea>
+            <span class="hint">For cross-origin Roundcube embedding, keep X-Frame-Options disabled and include your Roundcube origin (e.g. <code>https://mail.example.com</code>).</span>
+          </label>
+        </div>
+      </div>
     </div>
   </div>
 

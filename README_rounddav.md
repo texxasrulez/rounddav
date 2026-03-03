@@ -1,5 +1,5 @@
 # RoundDAV Server
-A lightweight CalDAV, CardDAV, and WebDAV storage engine designed for self-hosters who want full control without dragging in a monster stack. RoundDAV powers calendars, contacts, and file storage behind Roundcube — cleanly and predictably.
+A lightweight CalDAV, CardDAV, and WebDAV storage engine designed for self-hosters who want full control without dragging in a monster stack. RoundDAV powers calendars, contacts, and file storage behind Roundcube - cleanly and predictably.
 
 ---
 

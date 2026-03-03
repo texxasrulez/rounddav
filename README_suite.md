@@ -3,9 +3,9 @@ Turn Roundcube into a real personal groupware environment: email, calendars, con
 
 This suite combines:
 
-1. [**RoundDAV Server**](https://github.com/texxasrulez/rounddav) — CalDAV, CardDAV, WebDAV + Admin UI
-2. [**rounddav_provision**](https://github.com/texxasrulez/rounddav_provision) — Roundcube plugin for provisioning + SSO
-3. [**rounddav_files**](https://github.com/texxasrulez/rounddav_files) — Roundcube plugin for Files tab + attachments
+1. [**RoundDAV Server**](https://github.com/texxasrulez/rounddav) - CalDAV, CardDAV, WebDAV + Admin UI
+2. [**rounddav_provision**](https://github.com/texxasrulez/rounddav_provision) - Roundcube plugin for provisioning + SSO
+3. [**rounddav_files**](https://github.com/texxasrulez/rounddav_files) - Roundcube plugin for Files tab + attachments
 
 Together, they make Roundcube behave like a complete PIM stack instead of “just webmail.”
 
