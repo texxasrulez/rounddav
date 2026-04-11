@@ -4012,6 +4012,10 @@ elseif ($action === 'config'): ?>
     </div>
   </div>
 
+  <p><button class="btn" type="submit">Save configuration</button></p>
+</form>
+<p class="muted">Config file: <code><?= rdv_html(RDV_CONFIG_FILE) ?></code>. Rotating provision/SSO secrets requires updating Roundcube plugin settings.</p>
+
 <hr>
 <div class="share-config">
   <h3>Config Snapshot</h3>
@@ -4219,10 +4223,6 @@ elseif ($action === 'config'): ?>
     </div>
   </div>
 </div>
-
-  <p><button class="btn" type="submit">Save configuration</button></p>
-</form>
-<p class="muted">Config file: <code><?= rdv_html(RDV_CONFIG_FILE) ?></code>. Rotating provision/SSO secrets requires updating Roundcube plugin settings.</p>
 
 <?php
 endif;
