@@ -839,6 +839,13 @@ function rdv_write_config_file(array $config, string $configFile): void
     if (!empty($settings['auto_prune'])) {
         rdv_prune_config_backups($configFile, $settings);
     }
+
+    // Invalidate OPcache for the written config file
+    if (function_exists('opcache_invalidate')) {
+        @opcache_invalidate($configFile, true);
+    }
+    // Give the file system a tiny fraction of a second to sync 
+    usleep(100000); 
 }
 
 function rdv_backup_config_file(string $configFile): ?string
